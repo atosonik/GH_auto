@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Greenhouse Autofill",
+  "version": "1.0.0",
+  "description": "Fills Greenhouse application forms, including React Select dropdowns.",
+  "permissions": ["storage", "activeTab", "scripting", "webNavigation"],
+  "host_permissions": ["https://*.greenhouse.io/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Fill Greenhouse application"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://*.greenhouse.io/*"],
+      "js": ["profile.js", "filler.js", "autorun.js"],
+      "all_frames": true,
+      "run_at": "document_idle"
+    }
+  ]
+}

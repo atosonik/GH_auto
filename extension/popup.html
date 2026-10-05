@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body {
+        margin: 0;
+        width: 320px;
+        color: #1c1917;
+        background: #fafaf9;
+        font: 13px/1.4 "Segoe UI", sans-serif;
+      }
+      header {
+        padding: 12px 14px 8px;
+        background: #1f4d3a;
+        color: #f5f5f4;
+      }
+      header h1 {
+        margin: 0;
+        font-size: 14px;
+        font-weight: 650;
+      }
+      header p {
+        margin: 4px 0 0;
+        color: #d6e5dc;
+        font-size: 12px;
+      }
+      main {
+        padding: 12px 14px 14px;
+      }
+      label {
+        display: block;
+        margin: 8px 0 4px;
+        font-size: 12px;
+      }
+      input[type="text"],
+      input[type="email"],
+      input[type="tel"] {
+        box-sizing: border-box;
+        width: 100%;
+        padding: 6px 8px;
+        border: 1px solid #d6d3d1;
+        border-radius: 6px;
+        background: white;
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 10px;
+      }
+      button {
+        margin-top: 12px;
+        width: 100%;
+        padding: 8px 10px;
+        border: 0;
+        border-radius: 6px;
+        background: #1f4d3a;
+        color: white;
+        font-weight: 650;
+        cursor: pointer;
+      }
+      button.secondary {
+        background: white;
+        color: #1f4d3a;
+        border: 1px solid #1f4d3a;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      #status {
+        margin-top: 10px;
+        white-space: pre-wrap;
+        color: #44403c;
+        font-size: 12px;
+        max-height: 180px;
+        overflow: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Greenhouse autofill</h1>
+      <p>Fills the open application. It does not submit unless you ask it to.</p>
+    </header>
+    <main>
+      <label for="firstName">First name</label>
+      <input id="firstName" type="text" />
+      <label for="lastName">Last name</label>
+      <input id="lastName" type="text" />
+      <label for="email">Email</label>
+      <input id="email" type="email" />
+      <label for="phone">Phone</label>
+      <input id="phone" type="tel" />
+      <label for="linkedin">LinkedIn</label>
+      <input id="linkedin" type="text" />
+      <label for="location">Location</label>
+      <input id="location" type="text" />
+      <label for="company">Current company</label>
+      <input id="company" type="text" />
+      <label for="website">Website</label>
+      <input id="website" type="text" />
+      <label for="address">Legal address</label>
+      <input id="address" type="text" />
+      <label for="country">Country dropdown</label>
+      <input id="country" type="text" placeholder="United States" />
+      <label for="resume">Resume</label>
+      <input id="resume" type="file" accept=".pdf,.doc,.docx" />
+      <div class="row">
+        <input id="autoFill" type="checkbox" />
+        <label for="autoFill" style="margin: 0">Fill when the form opens</label>
+      </div>
+      <div class="row">
+        <input id="fillEeoc" type="checkbox" />
+        <label for="fillEeoc" style="margin: 0">Fill EEOC dropdowns from profile.js</label>
+      </div>
+      <button id="fill" type="button">Fill application</button>
+      <div class="row">
+        <input id="confirmSubmit" type="checkbox" />
+        <label for="confirmSubmit" style="margin: 0">I reviewed this application</label>
+      </div>
+      <button id="submit" class="secondary" type="button" disabled>Submit application</button>
+      <div id="status"></div>
+    </main>
+    <script src="profile.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

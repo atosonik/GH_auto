@@ -1,0 +1,33 @@
+# Local / secrets
+.app-data/
+.env
+.env.*
+*.pem
+*.key
+imap-tokens/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Node / build leftovers
+node_modules/
+dist/
+build/
+package-lock.json
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Local dumps / scratch
+whole element.html
+*.log

@@ -1,0 +1,5 @@
+PyQt5>=5.15
+playwright>=1.40
+pyperclip>=1.8
+python-dotenv>=1.0
+msal>=1.28
