@@ -1197,6 +1197,52 @@ def ask_deepseek_gaps(
     return best
 
 
+def ask_deepseek_pick_option(
+    page,
+    label: str,
+    answer: str,
+    options: list[str],
+    timeout_s: float = 90,
+) -> str | None:
+    """Ask which dropdown suggestion matches the answer; return that option text."""
+    if not options:
+        return None
+    composer = find_composer(page)
+    if not composer:
+        return None
+    try:
+        before_answers = int(page.evaluate(PAGE_STATE_JS).get("answerCount") or 0)
+    except Exception:
+        before_answers = 0
+    lines = [
+        f'For the application field "{label}", my answer is "{answer}".',
+        "Which of these dropdown options is the same thing? "
+        "Reply with ONLY the option number.",
+    ]
+    lines += [f"{i}. {text}" for i, text in enumerate(options, start=1)]
+    set_composer_value(page, composer, "\n".join(lines))
+    _sleep(300)
+    composer = find_composer(page) or composer
+    if not click_send(page, composer):
+        return None
+
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            state = page.evaluate(PAGE_STATE_JS)
+        except Exception:
+            _sleep(500)
+            continue
+        if int(state.get("answerCount") or 0) <= before_answers or state.get("stopping"):
+            _sleep(400)
+            continue
+        match = re.search(r"\b(\d{1,2})\b", str(state.get("reply") or ""))
+        if match and 1 <= int(match.group(1)) <= len(options):
+            return options[int(match.group(1)) - 1]
+        _sleep(400)
+    return None
+
+
 COVER_LETTER_PROMPT = (
     "Give me short cover letter to get hired faster for this position. "
     "do NOT write dash or hyphen in the answer and make answer in natural way. "

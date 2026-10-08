@@ -2026,23 +2026,29 @@ def _phone_national(phone: str) -> str:
     return digits
 
 
+def _answer_keywords(value: str) -> list[str]:
+    """Distinctive words of an answer, in order ("Illinois", "Urbana", "Champaign")."""
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9']*", str(value or ""))
+    out: list[str] = []
+    for word in words:
+        low = word.lower()
+        if len(low) < 2 or low in _TYPEAHEAD_STOPWORDS or low in {x.lower() for x in out}:
+            continue
+        out.append(word)
+    return out
+
+
 def _typeahead_queries(value: str) -> list[str]:
-    """Short search chunks: most distinctive word first, then a bit more."""
+    """Short search chunks: each distinctive word on its own, then the head."""
     head = str(value or "").split(",")[0].strip()
-    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'&.]*", head)
-    queries: list[str] = []
-    distinct = [
-        w for w in words
-        if len(w) >= 3 and w.lower().strip(".") not in _TYPEAHEAD_STOPWORDS
-    ]
-    if distinct:
-        queries.append(distinct[0])
-        if len(distinct) >= 2:
-            queries.append(f"{distinct[0]} {distinct[1]}")
-    elif words:
-        queries.append(words[0])
+    keywords = [k for k in _answer_keywords(head) if len(k) >= 3]
+    queries = keywords[:3]
+    if not queries:
+        words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'&.]*", head)
+        if words:
+            queries.append(words[0])
     if head:
-        queries.append(head[:24])
+        queries.append(head[:24].strip(" -,."))
     out: list[str] = []
     for q in queries:
         if q and q.lower() not in {x.lower() for x in out}:
@@ -2050,9 +2056,30 @@ def _typeahead_queries(value: str) -> list[str]:
     return out
 
 
+def _option_tokens(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", str(text or "").lower())
+
+
+def _word_matches(keyword: str, tokens: list[str]) -> bool:
+    """Keyword appears in option tokens: exact, prefix (IL→Illinois), or a near typo."""
+    from difflib import SequenceMatcher
+
+    key = keyword.lower()
+    for token in tokens:
+        if token == key:
+            return True
+        if len(key) >= 2 and token.startswith(key):
+            return True
+        if len(token) >= 4 and key.startswith(token):
+            return True
+        if len(key) >= 5 and len(token) >= 5 and SequenceMatcher(None, key, token).ratio() >= 0.8:
+            return True
+    return False
+
+
 def _match_tokens(text: str) -> set[str]:
     return {
-        t for t in re.findall(r"[a-z0-9]+", str(text or "").lower())
+        t for t in _option_tokens(text)
         if t not in {"of", "the", "at", "and", "in"}
     }
 
@@ -2066,8 +2093,37 @@ def _typeahead_score(answer: str, option: str) -> float:
     o = _match_tokens(option)
     if not a or not o:
         return 0.0
-    inter = len(a & o)
+    tokens = list(o)
+    inter = sum(1 for key in a if _word_matches(key, tokens))
     return inter / len(a) + 0.25 * inter / len(o)
+
+
+def narrow_candidates(answer: str, options: list[str]) -> tuple[str | None, list[str]]:
+    """
+    Filter suggestions keyword by keyword until one is left.
+    Returns (pick, candidates): pick is None when several still fit equally;
+    candidates is empty when no keyword matched any suggestion.
+    """
+    norm = lambda s: re.sub(r"\s+", " ", str(s or "").strip().lower())  # noqa: E731
+    for option in options:
+        if norm(option) == norm(answer):
+            return option, [option]
+    candidates = list(options)
+    matched_any = False
+    for keyword in _answer_keywords(answer):
+        hits = [o for o in candidates if _word_matches(keyword, _option_tokens(o))]
+        if not hits:
+            continue
+        matched_any = True
+        candidates = hits
+        if len(candidates) == 1:
+            return candidates[0], candidates
+    if not matched_any:
+        return None, []
+    ranked = sorted(candidates, key=lambda o: _typeahead_score(answer, o), reverse=True)
+    if _typeahead_score(answer, ranked[0]) - _typeahead_score(answer, ranked[1]) >= 0.3:
+        return ranked[0], candidates
+    return None, candidates
 
 
 def _locate_field_input(page, field_id: str, label: str):
@@ -2136,11 +2192,13 @@ def fill_typeahead_smart(
     label: str = "",
     value: str,
     accept_top: bool = True,
+    chooser=None,
 ) -> bool:
     """
     Dynamic dropdown (location, school, long lists): type only a short word,
-    then click the suggestion that best matches the full answer. A single
-    suggestion is clicked directly.
+    then narrow the suggestions by the answer's other keywords. If several
+    still fit, search the next keyword; if still ambiguous, `chooser(label,
+    answer, candidates)` (DeepSeek) picks one. A single suggestion is clicked.
     """
     answer = str(value or "").strip()
     if not answer:
@@ -2224,37 +2282,60 @@ def fill_typeahead_smart(
         _sleep(200)
         return committed()
 
-    def best_of(options: list[tuple[int, str]]) -> tuple[tuple[int, str], float]:
-        best = max(options, key=lambda item: _typeahead_score(answer, item[1]))
-        return best, _typeahead_score(answer, best[1])
+    def best_of(options: list[tuple[int, str]]) -> tuple[int, str]:
+        return max(options, key=lambda item: _typeahead_score(answer, item[1]))
+
+    def click_text(options: list[tuple[int, str]], text: str) -> bool:
+        for option in options:
+            if option[1] == text:
+                return click_option(option)
+        return False
 
     queries = _typeahead_queries(answer)
-    fallback_query = ""
+    # Smallest still-ambiguous candidate set seen, and the query that showed it.
+    ambiguous_query = ""
+    ambiguous: list[str] = []
+    weak_query = ""
     for query in queries:
         options = type_query(query)
         if options is None:
             return False
         if not options:
             continue
-        best, score = best_of(options)
-        if len(options) == 1 or score >= 0.75:
-            if click_option(best if len(options) > 1 else options[0]):
+        if len(options) == 1:
+            if click_option(options[0]):
                 return True
             continue
+        pick, candidates = narrow_candidates(answer, [text for _, text in options])
+        if pick and click_text(options, pick):
+            return True
         if accept_top:
-            if click_option(best if score > 0 else options[0]):
+            if click_option(best_of(options)):
                 return True
             continue
-        fallback_query = fallback_query or query
+        if candidates and (not ambiguous or len(candidates) < len(ambiguous)):
+            ambiguous_query, ambiguous = query, candidates
+        weak_query = weak_query or query
 
-    # Weak matches only: go back to the first chunk that had suggestions.
-    # No suggestions at all: the search API may just be slow — retry once.
-    retry_query = fallback_query or (queries[0] if queries else "")
+    retry_query = ambiguous_query or weak_query or (queries[0] if queries else "")
     if retry_query:
+        # Re-show the suggestions (slow search APIs get a longer wait).
         options = type_query(retry_query, wait_ms=8000) or []
         if options:
-            best, score = best_of(options)
-            if click_option(best if score > 0 else options[0]):
+            choice = ""
+            pool = ambiguous or [text for _, text in options]
+            if chooser is not None and len(pool) > 1:
+                try:
+                    choice = chooser(label, answer, pool) or ""
+                except Exception:
+                    choice = ""
+                if choice:
+                    # Chooser switched tabs; the menu closed — show it again.
+                    options = type_query(retry_query, wait_ms=8000) or []
+            if choice and click_text(options, choice):
+                return True
+            ranked = [o for o in options if o[1] in pool] or options
+            if click_option(best_of(ranked)):
                 return True
 
     # No suggestions at all: plain text inputs just take the full answer.
@@ -2722,10 +2803,12 @@ def apply_gap_answers(
     questions: list[dict[str, Any]] | None = None,
     *,
     use_playwright_fallback: bool = True,
+    chooser=None,
 ) -> dict[str, Any]:
     """
     Fill answers into the exact Greenhouse fields collected earlier.
     Prefer a list of {label, name, kind, answer}; dict label->answer is also accepted.
+    `chooser(label, answer, candidates)` resolves ambiguous typeahead suggestions.
     """
     page.bring_to_front()
     _sleep(80)
@@ -2783,6 +2866,7 @@ def apply_gap_answers(
                 label=label,
                 value=answer,
                 accept_top=bool(re.search(r"locat|city", label, re.I)),
+                chooser=chooser,
             )
         if ok:
             filled += 1

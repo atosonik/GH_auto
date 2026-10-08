@@ -28,6 +28,7 @@ from app.automation.deepseek import (
     _unwrap_resume_parse,
     ask_deepseek_cover_letter,
     ask_deepseek_gaps,
+    ask_deepseek_pick_option,
     assemble_prompt,
     load_profile_context,
     load_profiles_json,
@@ -237,6 +238,14 @@ class Runner:
         rules = list(gh_profile.get("dropdownRules") or []) + _eeoc_rules(gh_profile)
         checkbox_rules = list(gh_profile.get("checkboxRules") or [])
 
+        def choose_option(label: str, answer: str, candidates: list[str]) -> str | None:
+            self.set_job_state(profile_id, jobs, f"asking DeepSeek to pick: {label[:40]}")
+            focus_page(deepseek_page)
+            try:
+                return ask_deepseek_pick_option(deepseek_page, label, answer, candidates)
+            finally:
+                focus_page(greenhouse_page, retries=4)
+
         self.set_job_state(profile_id, jobs, "collecting required fields")
         questions = collect_questions(
             greenhouse_page,
@@ -271,7 +280,9 @@ class Runner:
                     profile_id, jobs, "warning: no question answers parsed from DeepSeek"
                 )
             else:
-                applied = apply_gap_answers(greenhouse_page, bound) or {}
+                applied = apply_gap_answers(
+                    greenhouse_page, bound, chooser=choose_option
+                ) or {}
                 if int(applied.get("filled") or 0) <= 0:
                     self.set_job_state(
                         profile_id, jobs, "warning: answers parsed but no fields matched"
@@ -311,7 +322,7 @@ class Runner:
             fixup.append(_bind_answer(question, value))
         if fixup:
             self.set_job_state(profile_id, jobs, "filling leftover required fields")
-            apply_gap_answers(greenhouse_page, fixup)
+            apply_gap_answers(greenhouse_page, fixup, chooser=choose_option)
         return answers
 
     def start(self, urls: list[dict[str, Any]], profiles: list[dict[str, Any]]) -> None:
