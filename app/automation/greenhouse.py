@@ -3140,6 +3140,22 @@ def fill_selects_playwright(page, items: list[dict[str, Any]]) -> dict[str, Any]
     return {"filled": filled, "log": log, "labels": labels}
 
 
+def reload_application(page, job_url: str) -> bool:
+    """Reload the job (fresh session), open the form again, wait until it is usable."""
+    page.once("dialog", lambda dialog: dialog.accept())
+    try:
+        page.goto(job_url, wait_until="domcontentloaded", timeout=60000)
+    except Exception:
+        page.reload(wait_until="domcontentloaded", timeout=60000)
+    _sleep(800)
+    if not application_form_ready(page, timeout_ms=4000):
+        try:
+            extract_job_description(page)  # clicks Apply on board pages
+        except Exception:
+            pass
+    return application_form_ready(page)
+
+
 def submit_application(page) -> dict[str, Any]:
     """
     Click Greenhouse's real "Submit application" button.
@@ -3298,6 +3314,52 @@ def detect_validation_errors(page) -> list[str]:
         return [str(x) for x in (raw or []) if str(x).strip()]
     except Exception:
         return []
+
+
+_SUBMIT_FAILURE_RE = re.compile(
+    r"(session (has )?expired|session timed out|please refresh|"
+    r"refresh the page|something went wrong|an error occurred|there was an error|"
+    r"error submitting|unable to submit|could not submit|failed to submit|"
+    r"try again later|invalid authenticity|too many requests)",
+    re.I,
+)
+
+
+def detect_submit_failure(page) -> str:
+    """Visible session-expired / generic submit error text, else ""."""
+    try:
+        texts = page.evaluate(
+            """() => {
+              const out = [];
+              for (const el of document.querySelectorAll(
+                "[role='alert'], .flash, .flash-error, .error-message, .alert, .notice, " +
+                ".application--error, .form-error, [class*='banner'], [class*='toast']"
+              )) {
+                if (el.getClientRects().length) out.push((el.innerText || '').trim());
+              }
+              const app = document.querySelector('.application--container, #application, form');
+              if (app) out.push((app.innerText || '').slice(-1500));
+              out.push(document.title || '');
+              return out;
+            }"""
+        ) or []
+    except Exception:
+        return ""
+    for text in texts:
+        match = _SUBMIT_FAILURE_RE.search(str(text or ""))
+        if match:
+            start = max(0, match.start() - 40)
+            return re.sub(r"\s+", " ", str(text)[start : match.end() + 60]).strip()
+    return ""
+
+
+def application_form_ready(page, timeout_ms: int = 20000) -> bool:
+    """True once the Greenhouse application form (email field) is on the page."""
+    try:
+        page.wait_for_selector("#email, #first_name, input[type='email']", timeout=timeout_ms)
+        return True
+    except Exception:
+        return False
 
 
 def detect_security_code_field(page) -> dict[str, Any]:

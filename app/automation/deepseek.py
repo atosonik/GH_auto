@@ -845,9 +845,21 @@ QUESTION_SYSTEM_PROMPT = (
     "Name, location, and education questions: use the candidate facts and the "
     "resume JSON from this chat.\n"
     "\n"
-    "Return ONLY a JSON object. Prefer numbered keys matching the list "
-    '(example: {"1":"Yes","2":"..."}). You may also use the exact question '
-    "labels as keys. No markdown fences, no commentary, no resume JSON."
+    "Answer EVERY question. Never leave a value empty. If the candidate context "
+    "does not cover a question, give the generic, typical (average) answer a strong "
+    "candidate for this role would give.\n"
+    "\n"
+    "Method:\n"
+    "1. First think step by step. For each question write one or two short lines of "
+    "reasoning (which fact, resume detail, or job requirement decides it).\n"
+    "2. Then, at the very end, output the final answers as ONE JSON object inside a "
+    "```json code block. Use numbered keys matching the list "
+    '(example: {"1":"Yes","2":"..."}). No resume JSON.'
+)
+
+GENERIC_RETRY_NOTE = (
+    "These questions were left unanswered. Give a generic, average answer for "
+    "each one. Do not skip any."
 )
 
 _RESUME_SHAPE_KEYS = {
@@ -867,13 +879,16 @@ def _parse_answers_object(text: str) -> dict[str, Any]:
         return {}
     from app.automation.json_repair import repair_json
 
-    chunks: list[str] = []
-    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-    if fenced:
-        chunks.append(fenced.group(1).strip())
-    match = re.search(r"\{[\s\S]*\}", text)
-    if match:
-        chunks.append(match.group(0))
+    # Step-by-step reasoning comes first; the final JSON block is the answer.
+    chunks: list[str] = [
+        block.strip()
+        for block in reversed(re.findall(r"```(?:json)?\s*([\s\S]*?)```", text))
+    ]
+    starts = [m.start() for m in re.finditer(r"\{", text)]
+    for start in reversed(starts[-6:]):
+        end = text.rfind("}")
+        if end > start:
+            chunks.append(text[start : end + 1])
     chunks.append(text)
 
     for chunk in chunks:
@@ -1090,6 +1105,7 @@ def ask_deepseek_gaps(
     page,
     questions: list[dict[str, Any]],
     profile_context: str = "",
+    generic: bool = False,
 ) -> dict[str, Any]:
     composer = find_composer(page)
     if not composer:
@@ -1109,6 +1125,8 @@ def ask_deepseek_gaps(
         before_reply = ""
 
     lines = [QUESTION_SYSTEM_PROMPT, ""]
+    if generic:
+        lines.extend([GENERIC_RETRY_NOTE, ""])
     if profile_context:
         lines.extend(["Candidate context:", profile_context.strip(), ""])
     lines.append("Questions:")
@@ -1192,7 +1210,8 @@ def ask_deepseek_gaps(
     if not click_send(page, composer):
         raise RuntimeError("Could not send application questions to DeepSeek")
 
-    deadline = time.time() + 180
+    # Step-by-step reasoning makes replies longer.
+    deadline = time.time() + 300
     last_reply = ""
     quiet_since = time.time()
     best: dict[str, str] = {}
@@ -1243,8 +1262,8 @@ def ask_deepseek_gaps(
             len(best) >= len(labels) or len(best) >= needed
         )
         if complete and not stopping:
-            # Short answer JSON often finishes in one shot — don't wait forever.
-            if len(best) >= len(labels) or (time.time() - quiet_since) >= 1.0:
+            # Partial sets wait for the reasoning stream to settle first.
+            if len(best) >= len(labels) or (time.time() - quiet_since) >= 2.5:
                 return best
 
         _sleep(400)

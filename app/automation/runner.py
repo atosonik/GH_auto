@@ -42,16 +42,24 @@ from app.automation.greenhouse import (
     cover_letter_state,
     detect_security_code_field,
     detect_submission_success,
+    detect_submit_failure,
     detect_validation_errors,
     extract_job_description,
     fill_cover_letter_text,
     fill_security_code,
     prefill_contact_fields,
+    reload_application,
     submit_application,
     upload_resume,
 )
 from app.automation.outlook_web_otp import wait_for_security_code_with_fallback
 from app.automation.resume import ResumeBridge
+
+MAX_SUBMIT_ATTEMPTS = 8
+
+
+class FatalJobError(RuntimeError):
+    """A failure that refreshing and re-filling the form cannot fix."""
 
 
 def resolve_imap_config(
@@ -160,6 +168,48 @@ def _answer_for(answers: dict[str, Any], question: dict[str, Any], index: int | 
     return None
 
 
+def _generic_answer(question: dict[str, Any], gh_profile: dict[str, Any]) -> str | None:
+    """Typical / average answer for a required field nobody answered."""
+    label = str(question.get("label") or "").strip()
+    lab = label.lower()
+    kind = str(question.get("kind") or "")
+    choices = [str(c).strip() for c in (question.get("choices") or []) if str(c).strip()]
+    if choices:
+        neutral = [
+            c for c in choices
+            if re.search(r"prefer not|decline|not applicable|\bn/?a\b|^none", c, re.I)
+        ]
+        if neutral:
+            return neutral[0]
+        if len(choices) <= 2:
+            return choices[0]
+        return choices[len(choices) // 2]
+    fact = _fact_for_label(label, gh_profile)
+    if fact:
+        return fact
+    if kind in {"typeahead", "select", "checkbox", "single_checkbox"}:
+        return None
+    personal = gh_profile.get("personal") or {}
+    if re.search(r"linkedin", lab):
+        return personal.get("linkedin") or None
+    if re.search(r"website|portfolio|github|url", lab):
+        return personal.get("website") or personal.get("linkedin") or None
+    if re.search(r"salary|compensation|pay expectation|desired pay|rate", lab):
+        return "Open to a competitive offer in line with the market for this role"
+    if re.search(r"how many years|years of|number of years", lab):
+        return "5"
+    if re.search(r"start date|notice|when can you start|availability|available to start", lab):
+        return "Two weeks after an offer"
+    if re.search(r"hear about|how did you find|referr|source", lab):
+        return "LinkedIn"
+    if kind == "textarea":
+        return (
+            "My recent work lines up closely with this role, and I would be glad to "
+            "walk through specific examples in an interview."
+        )
+    return "Yes"
+
+
 def _bind_answer(question: dict[str, Any], value: Any) -> dict[str, Any]:
     label = str(question.get("label") or "").strip()
     kind = str(question.get("kind") or "text")
@@ -229,11 +279,13 @@ class Runner:
         context_text: str,
         profile_id: str,
         jobs: list[dict[str, Any]],
+        answer_cache: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Collect every required field → one DeepSeek request → fill from its JSON.
-        Single-option fields are clicked without asking. Rules / profile facts
-        are only used afterwards for anything that is still empty.
+        Skipped questions are re-asked for a generic answer, then given a local
+        generic default, so every required field gets a value. Single-option
+        fields are clicked without asking. Returns the label → answer cache.
         """
         rules = list(gh_profile.get("dropdownRules") or []) + _eeoc_rules(gh_profile)
         checkbox_rules = list(gh_profile.get("checkboxRules") or [])
@@ -259,34 +311,52 @@ class Runner:
             apply_gap_answers(greenhouse_page, auto)
         questions = [q for q in questions if not q.get("autoValue")]
 
-        answers: dict[str, Any] = {}
-        if questions:
+        cache = answer_cache if answer_cache is not None else {}
+
+        def key_of(question: dict[str, Any]) -> str:
+            return str(question.get("label") or "").strip().lower()
+
+        def absorb(asked: list[dict[str, Any]], reply: dict[str, Any]) -> None:
+            for idx, question in enumerate(asked, start=1):
+                value = _answer_for(reply or {}, question, idx)
+                if value is not None and str(value).strip():
+                    cache[key_of(question)] = value
+
+        # After a refresh the same labels come back — reuse, don't re-ask.
+        to_ask = [q for q in questions if key_of(q) not in cache]
+        if to_ask:
             self.set_job_state(
-                profile_id, jobs, f"asking DeepSeek ({len(questions)} fields)"
+                profile_id, jobs, f"asking DeepSeek ({len(to_ask)} fields)"
             )
             focus_page(deepseek_page)
-            answers = ask_deepseek_gaps(
-                deepseek_page, questions, profile_context=context_text
-            ) or {}
-            focus_page(greenhouse_page, retries=4)
-            self.set_job_state(profile_id, jobs, "filling answers")
-            bound = []
-            for idx, question in enumerate(questions, start=1):
-                value = _answer_for(answers, question, idx)
-                if value is not None:
-                    bound.append(_bind_answer(question, value))
-            if not bound:
+            absorb(to_ask, ask_deepseek_gaps(
+                deepseek_page, to_ask, profile_context=context_text
+            ))
+            missing = [q for q in to_ask if key_of(q) not in cache]
+            if missing:
                 self.set_job_state(
-                    profile_id, jobs, "warning: no question answers parsed from DeepSeek"
+                    profile_id, jobs, f"asking DeepSeek for {len(missing)} skipped fields"
                 )
-            else:
-                applied = apply_gap_answers(
-                    greenhouse_page, bound, chooser=choose_option
-                ) or {}
-                if int(applied.get("filled") or 0) <= 0:
-                    self.set_job_state(
-                        profile_id, jobs, "warning: answers parsed but no fields matched"
-                    )
+                absorb(missing, ask_deepseek_gaps(
+                    deepseek_page, missing, profile_context=context_text, generic=True
+                ))
+            focus_page(greenhouse_page, retries=4)
+            for question in to_ask:
+                if key_of(question) not in cache:
+                    generic = _generic_answer(question, gh_profile)
+                    if generic is not None:
+                        cache[key_of(question)] = generic
+
+        bound = [
+            _bind_answer(q, cache[key_of(q)]) for q in questions if key_of(q) in cache
+        ]
+        if bound:
+            self.set_job_state(profile_id, jobs, "filling answers")
+            applied = apply_gap_answers(greenhouse_page, bound, chooser=choose_option) or {}
+            if int(applied.get("filled") or 0) <= 0:
+                self.set_job_state(
+                    profile_id, jobs, "warning: answers parsed but no fields matched"
+                )
 
         remaining = collect_questions(
             greenhouse_page,
@@ -299,7 +369,7 @@ class Runner:
             label = str(question.get("label") or "").strip()
             label_l = label.lower()
             kind = str(question.get("kind") or "")
-            value = _answer_for(answers, question, None)
+            value = _answer_for(cache, question, None)
             if value is None:
                 value = question.get("autoValue") or question.get("ruleValue")
             if value is None:
@@ -318,12 +388,159 @@ class Runner:
                 ):
                     value = "Yes"
             if value is None:
+                value = _generic_answer(question, gh_profile)
+            if value is None:
                 continue
             fixup.append(_bind_answer(question, value))
         if fixup:
             self.set_job_state(profile_id, jobs, "filling leftover required fields")
             apply_gap_answers(greenhouse_page, fixup, chooser=choose_option)
-        return answers
+        return cache
+
+    def _fill_form(
+        self,
+        greenhouse_page,
+        deepseek_page,
+        gh_profile: dict[str, Any],
+        context_text: str,
+        pdf_path: str,
+        answer_cache: dict[str, Any],
+        cover_text: str,
+        profile_id: str,
+        jobs: list[dict[str, Any]],
+        url_item: dict[str, Any],
+    ) -> str:
+        """Prefill contact, upload resume, answer required fields, cover letter."""
+        focus_page(greenhouse_page, retries=4)
+        prefill_contact_fields(greenhouse_page, gh_profile["personal"])
+
+        url_item["state"] = "uploading resume"
+        self.set_job_state(profile_id, jobs, "uploading resume")
+        upload_resume(greenhouse_page, pdf_path)
+
+        url_item["state"] = "filling"
+        self._fill_required(
+            greenhouse_page,
+            deepseek_page,
+            gh_profile,
+            context_text,
+            profile_id,
+            jobs,
+            answer_cache=answer_cache,
+        )
+
+        letter = cover_letter_state(greenhouse_page)
+        if letter.get("required") and not letter.get("filled"):
+            if not cover_text:
+                url_item["state"] = "writing cover letter"
+                self.set_job_state(profile_id, jobs, "writing cover letter")
+                focus_page(deepseek_page)
+                cover_text = ask_deepseek_cover_letter(deepseek_page)
+                focus_page(greenhouse_page, retries=4)
+            if not fill_cover_letter_text(greenhouse_page, cover_text):
+                raise RuntimeError(
+                    "Cover letter is required but could not be pasted via Enter manually"
+                )
+            url_item["coverLetter"] = True
+        return cover_text
+
+    def _submit_and_confirm(
+        self,
+        greenhouse_page,
+        deepseek_page,
+        context,
+        gh_profile: dict[str, Any],
+        context_text: str,
+        answer_cache: dict[str, Any],
+        imap_cfg: dict[str, Any],
+        name: str,
+        profile_id: str,
+        jobs: list[dict[str, Any]],
+        url_item: dict[str, Any],
+    ) -> tuple[bool, str]:
+        """
+        Click Submit and wait for the thank-you page, handling the email security
+        code and one validation-error re-fill. Returns (confirmed, problem).
+        """
+        focus_page(greenhouse_page, retries=3)
+        try:
+            greenhouse_page.bring_to_front()
+        except Exception:
+            pass
+        url_item["state"] = "submitting"
+        self.set_job_state(profile_id, jobs, "submitting")
+        submit_result = submit_application(greenhouse_page) or {}
+        url_item["submit"] = submit_result.get("via") or submit_result.get("clicked") or "clicked"
+
+        resubmit_used = False
+        validation_fix_used = False
+        started = time.time()
+        while time.time() < started + 120:
+            if detect_submission_success(greenhouse_page):
+                return True, ""
+            code_field = detect_security_code_field(greenhouse_page)
+            if code_field.get("found"):
+                url_item["state"] = "security code"
+                self.set_job_state(profile_id, jobs, "security code")
+                if not str(imap_cfg.get("user") or "").strip():
+                    raise FatalJobError(
+                        "Greenhouse asked for an email security code, but "
+                        "this profile has no IMAP mailbox. Set imap.user "
+                        f"or add email to profiles.json for {name!r}."
+                    )
+                code = wait_for_security_code_with_fallback(
+                    imap_cfg,
+                    browser_context=context,
+                    timeout_ms=180000,
+                )
+                filled = fill_security_code(greenhouse_page, code) or {}
+                if not filled.get("ok"):
+                    return False, f"could not fill security code {code!r}: {filled}"
+                url_item["securityCode"] = code
+                submit_application(greenhouse_page)
+                time.sleep(1.5)
+                continue
+
+            failure = detect_submit_failure(greenhouse_page)
+            if failure:
+                return False, f"Greenhouse error: {failure}"
+
+            errors = detect_validation_errors(greenhouse_page)
+            if errors and not validation_fix_used:
+                validation_fix_used = True
+                self.set_job_state(profile_id, jobs, "fixing validation errors")
+                try:
+                    prefill_contact_fields(greenhouse_page, gh_profile["personal"])
+                    self._fill_required(
+                        greenhouse_page,
+                        deepseek_page,
+                        gh_profile,
+                        context_text,
+                        profile_id,
+                        jobs,
+                        answer_cache=answer_cache,
+                    )
+                    submit_application(greenhouse_page)
+                except Exception:
+                    pass
+                time.sleep(1.5)
+                continue
+
+            # Still on the application form after a few seconds? click again.
+            if not resubmit_used and (time.time() - started) >= 8:
+                resubmit_used = True
+                try:
+                    still = greenhouse_page.locator(".application--submit button[type='submit']")
+                    if still.count() > 0 and still.first.is_visible():
+                        self.set_job_state(profile_id, jobs, "submitting (retry)")
+                        submit_application(greenhouse_page)
+                except Exception:
+                    pass
+            time.sleep(1.0)
+
+        errs = detect_validation_errors(greenhouse_page)
+        detail = (" Validation: " + "; ".join(errs[:6])) if errs else ""
+        return False, "no confirmation page after submit." + detail
 
     def start(self, urls: list[dict[str, Any]], profiles: list[dict[str, Any]]) -> None:
         if not urls:
@@ -616,155 +833,69 @@ class Runner:
                             },
                         )
                         context_text = _with_candidate_facts(profile_context, gh_profile)
-
-                        # Only email / phone / phone country / LinkedIn are prefilled.
-                        prefill_contact_fields(greenhouse_page, gh_profile["personal"])
-
-                        url_item["state"] = "uploading resume"
-                        self.set_job_state(profile_id, jobs, "uploading resume")
-                        upload_resume(greenhouse_page, pdf_path)
-
-                        self._fill_required(
-                            greenhouse_page,
-                            deepseek_page,
-                            gh_profile,
-                            context_text,
-                            profile_id,
-                            jobs,
-                        )
-
-                        letter = cover_letter_state(greenhouse_page)
-                        if letter.get("required") and not letter.get("filled"):
-                            url_item["state"] = "writing cover letter"
-                            self.set_job_state(profile_id, jobs, "writing cover letter")
-                            focus_page(deepseek_page)
-                            cover_text = ask_deepseek_cover_letter(deepseek_page)
-                            focus_page(greenhouse_page, retries=4)
-                            if not fill_cover_letter_text(greenhouse_page, cover_text):
-                                raise RuntimeError(
-                                    "Cover letter is required but could not be pasted "
-                                    "via Enter manually"
-                                )
-                            url_item["coverLetter"] = True
-
-                        focus_page(greenhouse_page, retries=3)
-                        try:
-                            greenhouse_page.bring_to_front()
-                        except Exception:
-                            pass
                         imap_cfg = resolve_imap_config(profile, personal)
-                        url_item["state"] = "submitting"
-                        self.set_job_state(profile_id, jobs, "submitting")
-                        submit_result = submit_application(greenhouse_page) or {}
-                        if not submit_result.get("ok"):
-                            raise RuntimeError(
-                                "Submit application click failed: "
-                                f"{submit_result.get('reason') or submit_result}"
-                            )
-                        url_item["submit"] = submit_result.get("via") or submit_result.get(
-                            "clicked"
-                        ) or "clicked"
-
-                        # Confirmation page is mandatory — wait for thank-you /
-                        # confirmation URL. Handle security-code interstitial if it appears.
-                        # If validation errors block submit, refill + resubmit once.
+                        answer_cache: dict[str, Any] = {}
+                        cover_text = ""
                         confirmed = False
-                        resubmit_used = False
-                        validation_fix_used = False
-                        confirm_started = time.time()
-                        confirm_deadline = confirm_started + 120
-                        while time.time() < confirm_deadline:
-                            if detect_submission_success(greenhouse_page):
-                                confirmed = True
+                        problem = ""
+                        attempt = 0
+                        # Session expired / error banner / no thank-you page:
+                        # refresh, re-fill from cached answers, submit again.
+                        while not confirmed and attempt < MAX_SUBMIT_ATTEMPTS:
+                            if self.stop_requested:
                                 break
-                            code_field = detect_security_code_field(greenhouse_page)
-                            if code_field.get("found"):
-                                url_item["state"] = "security code"
-                                self.set_job_state(profile_id, jobs, "security code")
-                                if not str(imap_cfg.get("user") or "").strip():
-                                    raise RuntimeError(
-                                        "Greenhouse asked for an email security code, but "
-                                        "this profile has no IMAP mailbox. Set imap.user "
-                                        f"or add email to profiles.json for {name!r}."
-                                    )
-                                code = wait_for_security_code_with_fallback(
-                                    imap_cfg,
-                                    browser_context=context,
-                                    timeout_ms=180000,
-                                )
-                                filled = fill_security_code(greenhouse_page, code) or {}
-                                if not filled.get("ok"):
-                                    raise RuntimeError(
-                                        f"Got security code {code!r} but could not fill "
-                                        f"the 8-box verification inputs: {filled}"
-                                    )
-                                url_item["securityCode"] = code
-                                submit_application(greenhouse_page)
-                                time.sleep(1.5)
-                                continue
-
-                            errors = detect_validation_errors(greenhouse_page)
-                            if errors and not validation_fix_used:
-                                validation_fix_used = True
-                                self.set_job_state(
-                                    profile_id,
-                                    jobs,
-                                    "fixing validation errors",
-                                )
-                                # Contact prefill again, then the same
-                                # collect → DeepSeek → fill pass for leftovers.
-                                try:
-                                    prefill_contact_fields(
-                                        greenhouse_page, gh_profile["personal"]
-                                    )
-                                except Exception:
-                                    pass
-                                try:
-                                    self._fill_required(
-                                        greenhouse_page,
-                                        deepseek_page,
-                                        gh_profile,
-                                        context_text,
+                            attempt += 1
+                            try:
+                                if attempt > 1:
+                                    url_item["state"] = "refreshing"
+                                    self.set_job_state(
                                         profile_id,
                                         jobs,
+                                        f"refresh + re-fill (attempt {attempt}): {problem[:80]}",
                                     )
-                                except Exception:
-                                    pass
-                                try:
-                                    submit_application(greenhouse_page)
-                                except Exception:
-                                    pass
-                                time.sleep(1.5)
-                                continue
-
-                            # Still on the application form after a few seconds? click again.
-                            if not resubmit_used and (time.time() - confirm_started) >= 8:
-                                try:
-                                    still = greenhouse_page.locator(
-                                        ".application--submit button[type='submit']"
-                                    )
-                                    if still.count() > 0 and still.first.is_visible():
-                                        self.set_job_state(
-                                            profile_id, jobs, "submitting (retry)"
-                                        )
-                                        submit_application(greenhouse_page)
-                                        resubmit_used = True
-                                except Exception:
-                                    resubmit_used = True
-                            time.sleep(1.0)
+                                    focus_page(greenhouse_page, retries=3)
+                                    if not reload_application(greenhouse_page, job_url):
+                                        problem = "application form did not load after refresh"
+                                        time.sleep(5)
+                                        continue
+                                cover_text = self._fill_form(
+                                    greenhouse_page,
+                                    deepseek_page,
+                                    gh_profile,
+                                    context_text,
+                                    pdf_path,
+                                    answer_cache,
+                                    cover_text,
+                                    profile_id,
+                                    jobs,
+                                    url_item,
+                                )
+                                confirmed, problem = self._submit_and_confirm(
+                                    greenhouse_page,
+                                    deepseek_page,
+                                    context,
+                                    gh_profile,
+                                    context_text,
+                                    answer_cache,
+                                    imap_cfg,
+                                    name,
+                                    profile_id,
+                                    jobs,
+                                    url_item,
+                                )
+                            except FatalJobError:
+                                raise
+                            except Exception as error:
+                                problem = str(error)
 
                         if not confirmed:
-                            errs = detect_validation_errors(greenhouse_page)
-                            detail = (
-                                " Validation: " + "; ".join(errs[:6])
-                                if errs
-                                else ""
-                            )
+                            if self.stop_requested:
+                                url_item["state"] = "skipped"
                             raise RuntimeError(
-                                'Submit was clicked but the Greenhouse confirmation '
-                                '("Thank you for applying") was not detected.'
-                                f"{detail} Not marking as submitted."
+                                f"Not confirmed after {attempt} attempt(s). "
+                                f"Last problem: {problem or 'stopped'}"
                             )
+                        url_item["attempts"] = attempt
 
                         url_item["state"] = "submitted"
                         url_item["confirmed"] = True
