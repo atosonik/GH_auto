@@ -26,6 +26,7 @@ from app.automation.deepseek import (
     _resume_ready,
     _snap_to_choice,
     _unwrap_resume_parse,
+    ask_deepseek_cover_letter,
     ask_deepseek_gaps,
     assemble_prompt,
     load_profile_context,
@@ -37,17 +38,141 @@ from app.automation.greenhouse import (
     apply_gap_answers,
     build_greenhouse_profile,
     collect_questions,
+    cover_letter_state,
     detect_security_code_field,
     detect_submission_success,
+    detect_validation_errors,
     extract_job_description,
-    fill_greenhouse_form,
+    fill_cover_letter_text,
     fill_security_code,
-    fill_selects_playwright,
+    prefill_contact_fields,
     submit_application,
     upload_resume,
 )
-from app.automation.imap_client import wait_for_security_code
+from app.automation.outlook_web_otp import wait_for_security_code_with_fallback
 from app.automation.resume import ResumeBridge
+
+
+def resolve_imap_config(
+    profile: dict[str, Any], personal: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """
+    IMAP config for OTP. If the UI left mailbox blank, fall back to
+    profiles.json email (common when adding a profile via outlook_login only).
+    """
+    imap = dict((profile or {}).get("imap") or {})
+    user = str(imap.get("user") or "").strip()
+    if not user:
+        user = str((personal or {}).get("email") or "").strip()
+        if user:
+            imap["user"] = user
+    host = str(imap.get("host") or "").strip().lower()
+    preset = str(imap.get("preset") or "").strip().lower()
+    auth = str(imap.get("auth") or "").strip().lower()
+    if not auth:
+        if (
+            preset == "outlook"
+            or "outlook" in host
+            or "office365" in host
+            or user.lower().endswith("@outlook.com")
+            or user.lower().endswith("@hotmail.com")
+            or user.lower().endswith("@live.com")
+        ):
+            imap["auth"] = "oauth"
+            if not host:
+                imap["host"] = "outlook.office365.com"
+                imap["port"] = int(imap.get("port") or 993)
+            if not preset:
+                imap["preset"] = "outlook"
+    return imap
+
+
+def _profile_facts(gh_profile: dict[str, Any]) -> list[tuple[str, str]]:
+    personal = gh_profile.get("personal") or {}
+    edu = gh_profile.get("education") or {}
+    pairs = [
+        ("First name", personal.get("firstName")),
+        ("Last name", personal.get("lastName")),
+        ("Preferred name", personal.get("preferredName")),
+        ("Location", personal.get("location")),
+        ("Country", personal.get("country")),
+        ("School", edu.get("school")),
+        ("Degree", edu.get("degree")),
+        ("Discipline", edu.get("discipline")),
+    ]
+    return [(k, str(v).strip()) for k, v in pairs if str(v or "").strip()]
+
+
+def _with_candidate_facts(profile_context: str, gh_profile: dict[str, Any]) -> str:
+    facts = _profile_facts(gh_profile)
+    if not facts:
+        return profile_context
+    block = "Candidate facts:\n" + "\n".join(f"{k}: {v}" for k, v in facts)
+    return f"{profile_context.strip()}\n\n{block}" if profile_context.strip() else block
+
+
+def _fact_for_label(label: str, gh_profile: dict[str, Any]) -> str | None:
+    """Last-resort value from profiles.json / resume education for a label."""
+    facts = dict(_profile_facts(gh_profile))
+    lab = label.lower()
+    checks = [
+        (r"preferred", "Preferred name"),
+        (r"first name|given name", "First name"),
+        (r"last name|family name|surname", "Last name"),
+        (r"locat|city", "Location"),
+        (r"school|university|college", "School"),
+        (r"degree", "Degree"),
+        (r"discipline|major|field of study", "Discipline"),
+    ]
+    for pattern, key in checks:
+        if re.search(pattern, lab):
+            return facts.get(key)
+    return None
+
+
+def _eeoc_rules(gh_profile: dict[str, Any]) -> list[dict[str, Any]]:
+    if not gh_profile.get("fillEeoc"):
+        return []
+    eeoc = gh_profile.get("eeoc") or {}
+    pairs = [
+        ("gender", eeoc.get("gender")),
+        ("hispanic", eeoc.get("hispanic_ethnicity")),
+        ("veteran", eeoc.get("veteran_status")),
+        ("disability", eeoc.get("disability_status")),
+    ]
+    return [{"includes": k, "value": v} for k, v in pairs if v]
+
+
+def _answer_for(answers: dict[str, Any], question: dict[str, Any], index: int | None) -> Any:
+    label = str(question.get("label") or "").strip()
+    keys = [label]
+    if index is not None:
+        keys += [str(index), f"Q{index}", f"q{index}"]
+    for key in keys:
+        if key in answers and str(answers[key]).strip():
+            return answers[key]
+    label_l = label.lower()
+    for key, candidate in answers.items():
+        key_l = str(key).lower()
+        if key_l == label_l or label_l in key_l or key_l in label_l:
+            return candidate
+    return None
+
+
+def _bind_answer(question: dict[str, Any], value: Any) -> dict[str, Any]:
+    label = str(question.get("label") or "").strip()
+    kind = str(question.get("kind") or "text")
+    choices = [str(c).strip() for c in (question.get("choices") or []) if str(c).strip()]
+    answer = str(value).strip()
+    if choices and kind in {"select", "checkbox"}:
+        answer = _snap_to_choice(answer, choices)
+    return {
+        "label": label,
+        "name": question.get("name") or question.get("id") or label,
+        "kind": kind,
+        "choices": choices,
+        "answer": answer,
+    }
 
 
 class Runner:
@@ -94,6 +219,100 @@ class Runner:
                 "jobs": jobs,
             },
         )
+
+    def _fill_required(
+        self,
+        greenhouse_page,
+        deepseek_page,
+        gh_profile: dict[str, Any],
+        context_text: str,
+        profile_id: str,
+        jobs: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """
+        Collect every required field → one DeepSeek request → fill from its JSON.
+        Single-option fields are clicked without asking. Rules / profile facts
+        are only used afterwards for anything that is still empty.
+        """
+        rules = list(gh_profile.get("dropdownRules") or []) + _eeoc_rules(gh_profile)
+        checkbox_rules = list(gh_profile.get("checkboxRules") or [])
+
+        self.set_job_state(profile_id, jobs, "collecting required fields")
+        questions = collect_questions(
+            greenhouse_page,
+            read_choices=True,
+            dropdown_rules=rules,
+            checkbox_rules=checkbox_rules,
+        ) or []
+
+        auto = [_bind_answer(q, q["autoValue"]) for q in questions if q.get("autoValue")]
+        if auto:
+            apply_gap_answers(greenhouse_page, auto)
+        questions = [q for q in questions if not q.get("autoValue")]
+
+        answers: dict[str, Any] = {}
+        if questions:
+            self.set_job_state(
+                profile_id, jobs, f"asking DeepSeek ({len(questions)} fields)"
+            )
+            focus_page(deepseek_page)
+            answers = ask_deepseek_gaps(
+                deepseek_page, questions, profile_context=context_text
+            ) or {}
+            focus_page(greenhouse_page, retries=4)
+            self.set_job_state(profile_id, jobs, "filling answers")
+            bound = []
+            for idx, question in enumerate(questions, start=1):
+                value = _answer_for(answers, question, idx)
+                if value is not None:
+                    bound.append(_bind_answer(question, value))
+            if not bound:
+                self.set_job_state(
+                    profile_id, jobs, "warning: no question answers parsed from DeepSeek"
+                )
+            else:
+                applied = apply_gap_answers(greenhouse_page, bound) or {}
+                if int(applied.get("filled") or 0) <= 0:
+                    self.set_job_state(
+                        profile_id, jobs, "warning: answers parsed but no fields matched"
+                    )
+
+        remaining = collect_questions(
+            greenhouse_page,
+            read_choices=False,
+            dropdown_rules=rules,
+            checkbox_rules=checkbox_rules,
+        ) or []
+        fixup: list[dict[str, Any]] = []
+        for question in remaining:
+            label = str(question.get("label") or "").strip()
+            label_l = label.lower()
+            kind = str(question.get("kind") or "")
+            value = _answer_for(answers, question, None)
+            if value is None:
+                value = question.get("autoValue") or question.get("ruleValue")
+            if value is None:
+                value = _fact_for_label(label, gh_profile)
+            if value is None and kind == "select":
+                if any(x in label_l for x in ("visa", "sponsorship")):
+                    value = "No"
+                elif any(
+                    x in label_l
+                    for x in (
+                        "authorized to work",
+                        "legally authorized",
+                        "right to work",
+                        "eligible to work",
+                    )
+                ):
+                    value = "Yes"
+            if value is None:
+                continue
+            fixup.append(_bind_answer(question, value))
+        if fixup:
+            self.set_job_state(profile_id, jobs, "filling leftover required fields")
+            apply_gap_answers(greenhouse_page, fixup)
+        return answers
 
     def start(self, urls: list[dict[str, Any]], profiles: list[dict[str, Any]]) -> None:
         if not urls:
@@ -282,6 +501,7 @@ class Runner:
                             )
 
                         if isinstance(payload, dict):
+                            payload["auto"] = True
                             payload["name"] = name
                             target = payload.setdefault("target", {})
                             # Always prefer real JD metadata over model placeholders
@@ -384,216 +604,44 @@ class Runner:
                                 else None,
                             },
                         )
-                        fill_result = fill_greenhouse_form(greenhouse_page, gh_profile) or {}
+                        context_text = _with_candidate_facts(profile_context, gh_profile)
+
+                        # Only email / phone / phone country / LinkedIn are prefilled.
+                        prefill_contact_fields(greenhouse_page, gh_profile["personal"])
 
                         url_item["state"] = "uploading resume"
                         self.set_job_state(profile_id, jobs, "uploading resume")
                         upload_resume(greenhouse_page, pdf_path)
 
-                        # Remaining required questions. Skip opening every dropdown:
-                        # rule-covered Yes/No selects are filled locally (fast).
-                        rules = list(gh_profile.get("dropdownRules") or [])
-                        checkbox_rules = list(gh_profile.get("checkboxRules") or [])
-                        questions = collect_questions(
+                        self._fill_required(
                             greenhouse_page,
-                            read_choices=True,
-                            dropdown_rules=rules,
-                            checkbox_rules=checkbox_rules,
+                            deepseek_page,
+                            gh_profile,
+                            context_text,
+                            profile_id,
+                            jobs,
                         )
-                        if not questions:
-                            questions = [
-                                g
-                                for g in (fill_result.get("gaps") or [])
-                                if g.get("required", True)
-                                and not re.search(
-                                    r"location\s*\(city\)|^location\b|city,\s*state|currently located",
-                                    str(g.get("label") or ""),
-                                    re.I,
-                                )
-                            ]
-                        answers: dict[str, Any] = {}
 
-                        # Instant-fill selects / checkboxes we already know from rules.
-                        ruled_bound: list[dict[str, Any]] = []
-                        for question in list(questions):
-                            ruled = question.get("ruleValue")
-                            if not ruled:
-                                continue
-                            kind = str(question.get("kind") or "select")
-                            ruled_bound.append(
-                                {
-                                    "label": str(question.get("label") or "").strip(),
-                                    "name": question.get("name")
-                                    or question.get("id")
-                                    or question.get("label"),
-                                    "kind": kind if kind in {"select", "checkbox"} else "select",
-                                    "choices": list(question.get("choices") or []),
-                                    "answer": ruled,
-                                }
-                            )
-                        if ruled_bound:
-                            apply_gap_answers(
-                                greenhouse_page,
-                                ruled_bound,
-                                use_playwright_fallback=False,
-                            )
-                            # Drop rule-filled fields so DeepSeek only sees real gaps.
-                            ruled_labels = {
-                                str(q.get("label") or "").strip().lower()
-                                for q in questions
-                                if q.get("ruleValue")
-                            }
-                            questions = [
-                                q
-                                for q in questions
-                                if str(q.get("label") or "").strip().lower()
-                                not in ruled_labels
-                            ]
-
-                        if questions:
-                            url_item["state"] = "answering questions"
-                            self.set_job_state(profile_id, jobs, "answering questions")
+                        letter = cover_letter_state(greenhouse_page)
+                        if letter.get("required") and not letter.get("filled"):
+                            url_item["state"] = "writing cover letter"
+                            self.set_job_state(profile_id, jobs, "writing cover letter")
                             focus_page(deepseek_page)
-                            answers = ask_deepseek_gaps(
-                                deepseek_page,
-                                questions,
-                                profile_context=profile_context,
-                            ) or {}
-                            url_item["state"] = "filling answers"
-                            self.set_job_state(profile_id, jobs, "filling answers")
+                            cover_text = ask_deepseek_cover_letter(deepseek_page)
                             focus_page(greenhouse_page, retries=4)
-                            if answers:
-                                # Bind each answer to the exact collected field (id/label/kind).
-                                bound: list[dict[str, Any]] = []
-                                for idx, question in enumerate(questions, start=1):
-                                    label = str(question.get("label") or "").strip()
-                                    value = (
-                                        answers.get(label)
-                                        or answers.get(str(idx))
-                                        or answers.get(f"Q{idx}")
-                                        or answers.get(f"q{idx}")
-                                    )
-                                    if value is None:
-                                        # Fuzzy label match against model keys.
-                                        label_l = label.lower()
-                                        for key, candidate in answers.items():
-                                            key_l = str(key).lower()
-                                            if key_l == label_l or label_l in key_l or key_l in label_l:
-                                                value = candidate
-                                                break
-                                    if value is None:
-                                        continue
-                                    choices = [
-                                        str(c).strip()
-                                        for c in (question.get("choices") or [])
-                                        if str(c).strip()
-                                    ]
-                                    if choices:
-                                        value = _snap_to_choice(str(value), choices)
-                                    bound.append(
-                                        {
-                                            "label": label,
-                                            "name": question.get("name")
-                                            or question.get("id")
-                                            or label,
-                                            "kind": question.get("kind") or "text",
-                                            "choices": choices,
-                                            "answer": value,
-                                        }
-                                    )
-                                applied = apply_gap_answers(greenhouse_page, bound) or {}
-                                filled = int(
-                                    applied.get("filled") or len(applied.get("log") or [])
+                            if not fill_cover_letter_text(greenhouse_page, cover_text):
+                                raise RuntimeError(
+                                    "Cover letter is required but could not be pasted "
+                                    "via Enter manually"
                                 )
-                                if filled <= 0:
-                                    self.set_job_state(
-                                        profile_id,
-                                        jobs,
-                                        "warning: answers parsed but no fields matched",
-                                    )
-                            else:
-                                self.set_job_state(
-                                    profile_id,
-                                    jobs,
-                                    "warning: no question answers parsed from DeepSeek",
-                                )
-
-                        # Last pass: any required dropdown / checkbox still empty.
-                        remaining = collect_questions(
-                            greenhouse_page,
-                            read_choices=False,
-                            dropdown_rules=rules,
-                            checkbox_rules=checkbox_rules,
-                        ) or []
-                        select_fixup: list[dict[str, Any]] = []
-                        for q in remaining:
-                            kind = str(q.get("kind") or "")
-                            if kind not in {"select", "checkbox"}:
-                                continue
-                            label = str(q.get("label") or "").strip()
-                            label_l = label.lower()
-                            value = None
-                            for key, candidate in answers.items():
-                                key_l = str(key).lower()
-                                if key_l == label_l or label_l in key_l or key_l in label_l:
-                                    value = candidate
-                                    break
-                            if value is None:
-                                rule_list = checkbox_rules if kind == "checkbox" else rules
-                                for rule in rule_list:
-                                    needle = str(rule.get("includes") or "").lower()
-                                    if needle and needle in label_l:
-                                        value = rule.get("value")
-                                        break
-                            if value is None and q.get("ruleValue"):
-                                value = q.get("ruleValue")
-                            if value is None and kind == "select" and any(
-                                x in label_l for x in ("visa", "sponsorship")
-                            ):
-                                value = "No"
-                            if value is None and kind == "select" and any(
-                                x in label_l
-                                for x in (
-                                    "authorized to work",
-                                    "legally authorized",
-                                    "right to work",
-                                    "eligible to work",
-                                )
-                            ):
-                                value = "Yes"
-                            if value is None:
-                                continue
-                            choices = [
-                                str(c).strip()
-                                for c in (q.get("choices") or [])
-                                if str(c).strip()
-                            ]
-                            if choices and kind == "select":
-                                value = _snap_to_choice(str(value), choices)
-                            select_fixup.append(
-                                {
-                                    "label": label,
-                                    "name": q.get("name") or q.get("id") or label,
-                                    "kind": kind,
-                                    "choices": choices,
-                                    "answer": value,
-                                }
-                            )
-                        if select_fixup:
-                            self.set_job_state(
-                                profile_id, jobs, "filling required dropdowns"
-                            )
-                            apply_gap_answers(greenhouse_page, select_fixup)
-                            fill_selects_playwright(
-                                greenhouse_page,
-                                [x for x in select_fixup if x.get("kind") == "select"],
-                            )
+                            url_item["coverLetter"] = True
 
                         focus_page(greenhouse_page, retries=3)
                         try:
                             greenhouse_page.bring_to_front()
                         except Exception:
                             pass
+                        imap_cfg = resolve_imap_config(profile, personal)
                         url_item["state"] = "submitting"
                         self.set_job_state(profile_id, jobs, "submitting")
                         submit_result = submit_application(greenhouse_page) or {}
@@ -608,9 +656,10 @@ class Runner:
 
                         # Confirmation page is mandatory — wait for thank-you /
                         # confirmation URL. Handle security-code interstitial if it appears.
-                        # Re-click Submit once if we are still sitting on the form.
+                        # If validation errors block submit, refill + resubmit once.
                         confirmed = False
                         resubmit_used = False
+                        validation_fix_used = False
                         confirm_started = time.time()
                         confirm_deadline = confirm_started + 120
                         while time.time() < confirm_deadline:
@@ -621,7 +670,17 @@ class Runner:
                             if code_field.get("found"):
                                 url_item["state"] = "security code"
                                 self.set_job_state(profile_id, jobs, "security code")
-                                code = wait_for_security_code(profile.get("imap") or {})
+                                if not str(imap_cfg.get("user") or "").strip():
+                                    raise RuntimeError(
+                                        "Greenhouse asked for an email security code, but "
+                                        "this profile has no IMAP mailbox. Set imap.user "
+                                        f"or add email to profiles.json for {name!r}."
+                                    )
+                                code = wait_for_security_code_with_fallback(
+                                    imap_cfg,
+                                    browser_context=context,
+                                    timeout_ms=180000,
+                                )
                                 filled = fill_security_code(greenhouse_page, code) or {}
                                 if not filled.get("ok"):
                                     raise RuntimeError(
@@ -632,6 +691,41 @@ class Runner:
                                 submit_application(greenhouse_page)
                                 time.sleep(1.5)
                                 continue
+
+                            errors = detect_validation_errors(greenhouse_page)
+                            if errors and not validation_fix_used:
+                                validation_fix_used = True
+                                self.set_job_state(
+                                    profile_id,
+                                    jobs,
+                                    "fixing validation errors",
+                                )
+                                # Contact prefill again, then the same
+                                # collect → DeepSeek → fill pass for leftovers.
+                                try:
+                                    prefill_contact_fields(
+                                        greenhouse_page, gh_profile["personal"]
+                                    )
+                                except Exception:
+                                    pass
+                                try:
+                                    self._fill_required(
+                                        greenhouse_page,
+                                        deepseek_page,
+                                        gh_profile,
+                                        context_text,
+                                        profile_id,
+                                        jobs,
+                                    )
+                                except Exception:
+                                    pass
+                                try:
+                                    submit_application(greenhouse_page)
+                                except Exception:
+                                    pass
+                                time.sleep(1.5)
+                                continue
+
                             # Still on the application form after a few seconds? click again.
                             if not resubmit_used and (time.time() - confirm_started) >= 8:
                                 try:
@@ -649,10 +743,16 @@ class Runner:
                             time.sleep(1.0)
 
                         if not confirmed:
+                            errs = detect_validation_errors(greenhouse_page)
+                            detail = (
+                                " Validation: " + "; ".join(errs[:6])
+                                if errs
+                                else ""
+                            )
                             raise RuntimeError(
                                 'Submit was clicked but the Greenhouse confirmation '
-                                '("Thank you for applying") was not detected. '
-                                "Not marking as submitted."
+                                '("Thank you for applying") was not detected.'
+                                f"{detail} Not marking as submitted."
                             )
 
                         url_item["state"] = "submitted"

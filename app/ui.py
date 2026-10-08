@@ -72,6 +72,7 @@ def empty_profile() -> dict[str, Any]:
             "host": "outlook.office365.com",
             "port": 993,
             "user": "",
+            "auth": "oauth",
             "password": "",
         },
     }

@@ -793,6 +793,9 @@ QUESTION_SYSTEM_PROMPT = (
     "(example: 145000 or 140000-160000). No currency essay. No currency symbol required.\n"
     "- Use candidate context location when judging local market rates.\n"
     "\n"
+    "Name, location, and education questions: use the candidate facts and the "
+    "resume JSON from this chat.\n"
+    "\n"
     "Return ONLY a JSON object. Prefer numbered keys matching the list "
     '(example: {"1":"Yes","2":"..."}). You may also use the exact question '
     "labels as keys. No markdown fences, no commentary, no resume JSON."
@@ -1082,6 +1085,11 @@ def ask_deepseek_gaps(
         if re.match(r"^select\.?\.?\.?$", label, re.I):
             continue
         lines.append(f"{idx}. {label}")
+        if kind == "typeahead":
+            lines.append(
+                "   Type: search box — answer with the exact full value "
+                "(official school name, degree, major, or City, State)"
+            )
         if kind in {"text", "textarea"}:
             lines.append("   Type: free-text (type into the edit box)")
             if re.search(r"salary|compensation|pay|expect", label, re.I):
@@ -1187,4 +1195,81 @@ def ask_deepseek_gaps(
         _sleep(400)
 
     return best
+
+
+COVER_LETTER_PROMPT = (
+    "Give me short cover letter to get hired faster for this position. "
+    "do NOT write dash or hyphen in the answer and make answer in natural way. "
+    "Give me cover letter in the code block."
+)
+
+LAST_CODE_BLOCK_JS = """() => {
+  const roots = Array.from(document.querySelectorAll(
+    '.ds-assistant-message-main-content, [data-message-author-role="assistant"]'
+  ));
+  const top = roots.filter((el) => !roots.some((o) => o !== el && o.contains(el)));
+  const nodes = top.length ? top : Array.from(document.querySelectorAll('.ds-markdown'));
+  const last = nodes[nodes.length - 1];
+  if (!last) return "";
+  const blocks = Array.from(last.querySelectorAll('pre'))
+    .map((p) => (p.innerText || p.textContent || '').trim())
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length);
+  return blocks[0] || "";
+}"""
+
+
+def _strip_dashes(text: str) -> str:
+    out = re.sub(r"[ \t]*[\u2014\u2013][ \t]*", ", ", str(text or ""))
+    out = re.sub(r"[ \t]+-[ \t]+", ", ", out)
+    out = re.sub(r"(?<=\w)-(?=\w)", " ", out)
+    out = re.sub(r"(?m)^[ \t]*[-\u2022][ \t]*", "", out)
+    out = re.sub(r"[ \t]+,", ",", out)
+    out = re.sub(r",[ \t]*,", ",", out)
+    return out.strip()
+
+
+def ask_deepseek_cover_letter(page, timeout_s: float = 180) -> str:
+    """Ask for a short cover letter and return the code block contents."""
+    composer = find_composer(page)
+    if not composer:
+        raise RuntimeError("DeepSeek composer not found for cover letter")
+    try:
+        before_answers = int(page.evaluate(PAGE_STATE_JS).get("answerCount") or 0)
+    except Exception:
+        before_answers = 0
+
+    set_composer_value(page, composer, COVER_LETTER_PROMPT)
+    _sleep(300)
+    composer = find_composer(page) or composer
+    if not click_send(page, composer):
+        raise RuntimeError("Could not send cover letter request to DeepSeek")
+
+    deadline = time.time() + timeout_s
+    last_code = ""
+    stable_since = time.time()
+    while time.time() < deadline:
+        try:
+            state = page.evaluate(PAGE_STATE_JS)
+        except Exception:
+            _sleep(500)
+            continue
+        stopping = bool(state.get("stopping"))
+        if int(state.get("answerCount") or 0) <= before_answers:
+            _sleep(500)
+            continue
+        try:
+            code = str(page.evaluate(LAST_CODE_BLOCK_JS) or "").strip()
+        except Exception:
+            code = ""
+        if code != last_code:
+            last_code = code
+            stable_since = time.time()
+        if code and not stopping and (time.time() - stable_since) >= 1.5:
+            return _strip_dashes(code)
+        _sleep(400)
+
+    if last_code:
+        return _strip_dashes(last_code)
+    raise TimeoutError("DeepSeek did not return a cover letter code block")
 

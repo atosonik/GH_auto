@@ -230,6 +230,8 @@ def wait_for_security_code(imap_config: dict[str, Any], timeout_ms: int = 180000
     since = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%d-%b-%Y")
     # First connection may need interactive OAuth if token missing.
     interactive_once = cfg["auth"] == "oauth"
+    last_error: Exception | None = None
+    blocked_hits = 0
 
     while time.time() < deadline:
         client = None
@@ -254,8 +256,20 @@ def wait_for_security_code(imap_config: dict[str, Any], timeout_ms: int = 180000
                     code = extract_code(blob)
                     if code:
                         return code
-        except Exception:
-            pass
+        except Exception as error:
+            last_error = error
+            msg = str(error)
+            # Microsoft mailbox circuit-breaker — retrying IMAP won't help.
+            if re.search(r"authenticated but not connected", msg, re.I):
+                blocked_hits += 1
+                if blocked_hits >= 2:
+                    raise RuntimeError(
+                        "IMAP: User is authenticated but not connected "
+                        f"for {cfg['user']}. Microsoft is blocking IMAP on this "
+                        "mailbox (try captcha at "
+                        "https://outlook.live.com/owa/0/captchachallenge.aspx)."
+                    ) from error
+            interactive_once = False
         finally:
             if client is not None:
                 try:
@@ -264,4 +278,11 @@ def wait_for_security_code(imap_config: dict[str, Any], timeout_ms: int = 180000
                     pass
         time.sleep(5)
 
+    if last_error and re.search(
+        r"authenticated but not connected", str(last_error), re.I
+    ):
+        raise RuntimeError(
+            "IMAP: User is authenticated but not connected "
+            f"for {cfg['user']}."
+        ) from last_error
     raise TimeoutError("Timed out waiting for a security code email")

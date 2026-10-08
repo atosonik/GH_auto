@@ -968,16 +968,8 @@ APPLY_GAPS_JS = """async (items) => {
               continue;
             }
             const label = labelFor(input) || item.label || input.id || "";
-            const lab = normalize(label);
-            const isLoc =
-              !/country|countries|sponsorship|authorized|citizen/.test(lab) &&
-              (/location\\s*\\(city\\)|currently located|current location|city,\\s*state|city\\/state|where are you located|what city/.test(lab) ||
-                /^(city|location)\\b/.test(lab));
-            const isEdu =
-              /school name|^school\\b|university|college|degree|discipline|major|field of study/.test(lab);
             let ok = false;
-            if (isLoc || isEdu) ok = await fillLocation(input, value);
-            else if (kind === "select" || input.classList.contains("select__input")) ok = await fillSelect(input, value);
+            if (kind === "select" || input.classList.contains("select__input")) ok = await fillSelect(input, value);
             else {
               setNativeValue(input, value);
               ok = true;
@@ -1642,13 +1634,10 @@ COLLECT_QUESTIONS_JS = """() => {
     const lab = wrap.querySelector("label, .label");
     return !!(lab && /\\*/.test(lab.textContent || ""));
   }
-  const skipIds = new Set([
-    "first_name", "last_name", "email", "phone", "preferred_name", "country",
-    "gender", "hispanic_ethnicity", "veteran_status", "disability_status",
-    "resume", "cover_letter"
-  ]);
-  // Profile / typeahead-filled fields — keep off DeepSeek.
-  const skipLabel = /(first name|last name|email|phone|linkedin|github|resume|cover letter|password|security code|verification|gender|veteran|disability|hispanic|race|ethnicity|^location\\b|location \\(city\\)|city, state|currently located|school name|^school\\b|university|college|degree|discipline|major|field of study)/i;
+  // Only the contact prefill (email / phone / phone country / LinkedIn) and
+  // file uploads stay off DeepSeek — every other required field is collected.
+  const skipIds = new Set(["email", "phone", "country", "resume", "cover_letter", "cover_letter_text"]);
+  const skipLabel = /(^e-?mail\\b|^phone\\b|^country$|linkedin|^resume|cover letter|password|security code|verification code)/i;
   const out = [];
   const seen = new Set();
   let auto = 0;
@@ -1718,7 +1707,32 @@ COLLECT_QUESTIONS_JS = """() => {
       "textarea, input.input, input.input__single-line, input[type='text'], input:not([type]), input[type='email'], input[type='tel'], input[type='number']"
     );
     const input = selectInput || textInput;
-    if (!input) continue;
+    if (!input) {
+      // Lone required checkbox ("I acknowledge…") — single option, no fieldset.
+      const boxes = Array.from(wrap.querySelectorAll("input[type='checkbox']"));
+      if (boxes.length === 1 && !boxes[0].checked && isRequiredWrap(wrap, boxes[0])) {
+        const box = boxes[0];
+        const lab = (box.id && document.querySelector('label[for="' + CSS.escape(box.id) + '"]'))
+          || wrap.querySelector("label, .label");
+        const label = clean(lab ? lab.textContent : "");
+        if (label && !seen.has(label.toLowerCase())) {
+          seen.add(label.toLowerCase());
+          auto += 1;
+          if (!box.id) box.setAttribute("data-gh-q", "cb" + auto);
+          out.push({
+            label,
+            name: box.id || ("cb" + auto),
+            id: box.id || ("cb" + auto),
+            kind: "single_checkbox",
+            required: true,
+            value: "",
+            choices: [label],
+            fieldText: clean(wrap.innerText || wrap.textContent || "")
+          });
+        }
+      }
+      continue;
+    }
     if (input.type === "hidden" || input.type === "file" || input.type === "checkbox") continue;
     if (skipIds.has(input.id)) continue;
     if (!isRequiredWrap(wrap, input)) continue;
@@ -1974,6 +1988,569 @@ def _education_from_payload(payload: Any) -> dict[str, str]:
     return out
 
 
+TYPEAHEAD_MAX_CHOICES = 40
+
+_TYPEAHEAD_LABEL_RE = re.compile(
+    r"(^location\b|location\s*\(city\)|^city\b|current (city|location)|"
+    r"currently (located|based)|where (are|do) you (currently )?(located|based|live)|"
+    r"city,?\s*state|^school\b|school name|university|college)",
+    re.I,
+)
+_QUESTION_LEAD_RE = re.compile(
+    r"^(are|do|did|will|would|can|could|have|has|is|should)\b", re.I
+)
+_TYPEAHEAD_STOPWORDS = {
+    "university", "college", "of", "the", "at", "and", "in", "for", "institute",
+    "school", "state", "academy", "bachelor", "bachelors", "bachelor's",
+    "master", "masters", "master's", "degree", "science", "arts", "inc", "llc",
+}
+TYPEAHEAD_OPTION_SEL = (
+    ".select__menu .select__option:visible, "
+    "[role='listbox'] [role='option']:visible, "
+    ".pac-item:visible"
+)
+
+
+def is_typeahead_label(label: str) -> bool:
+    text = re.sub(r"\s+", " ", str(label or "")).strip()
+    if not text or len(text) > 90 or _QUESTION_LEAD_RE.search(text):
+        return False
+    return bool(_TYPEAHEAD_LABEL_RE.search(text))
+
+
+def _phone_national(phone: str) -> str:
+    raw = str(phone or "").strip()
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 11 and digits.startswith("1"):
+        return digits[1:]
+    return digits
+
+
+def _typeahead_queries(value: str) -> list[str]:
+    """Short search chunks: most distinctive word first, then a bit more."""
+    head = str(value or "").split(",")[0].strip()
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'&.]*", head)
+    queries: list[str] = []
+    distinct = [
+        w for w in words
+        if len(w) >= 3 and w.lower().strip(".") not in _TYPEAHEAD_STOPWORDS
+    ]
+    if distinct:
+        queries.append(distinct[0])
+        if len(distinct) >= 2:
+            queries.append(f"{distinct[0]} {distinct[1]}")
+    elif words:
+        queries.append(words[0])
+    if head:
+        queries.append(head[:24])
+    out: list[str] = []
+    for q in queries:
+        if q and q.lower() not in {x.lower() for x in out}:
+            out.append(q)
+    return out
+
+
+def _match_tokens(text: str) -> set[str]:
+    return {
+        t for t in re.findall(r"[a-z0-9]+", str(text or "").lower())
+        if t not in {"of", "the", "at", "and", "in"}
+    }
+
+
+def _typeahead_score(answer: str, option: str) -> float:
+    a_norm = re.sub(r"\s+", " ", str(answer or "").strip().lower())
+    o_norm = re.sub(r"\s+", " ", str(option or "").strip().lower())
+    if a_norm and a_norm == o_norm:
+        return 2.0
+    a = _match_tokens(answer)
+    o = _match_tokens(option)
+    if not a or not o:
+        return 0.0
+    inter = len(a & o)
+    return inter / len(a) + 0.25 * inter / len(o)
+
+
+def _locate_field_input(page, field_id: str, label: str):
+    """Find a form control by id / name / data-gh-q, then by label text."""
+    if field_id:
+        safe = field_id.replace("\\", "\\\\").replace('"', '\\"')
+        for sel in (f'[id="{safe}"]', f'[name="{safe}"]', f'[data-gh-q="{safe}"]'):
+            loc = page.locator(sel).first
+            try:
+                if loc.count() > 0:
+                    return loc
+            except Exception:
+                continue
+    if label:
+        try:
+            loc = page.get_by_label(re.compile(re.escape(label[:60]), re.I)).first
+            if loc.count() > 0:
+                return loc
+        except Exception:
+            pass
+        try:
+            lab = page.get_by_text(re.compile(re.escape(label[:60]), re.I)).first
+            wrap = lab.locator(
+                "xpath=ancestor::div[contains(@class,'field-wrapper') or contains(@class,'select') "
+                "or contains(@class,'field') or contains(@class,'input')][1]"
+            )
+            inp = wrap.locator(
+                "input.select__input, input[type='text'], input:not([type]), textarea"
+            ).first
+            if inp.count() > 0:
+                return inp
+        except Exception:
+            pass
+    return None
+
+
+def _visible_typeahead_options(page, wait_ms: int = 3500) -> list[tuple[int, str]]:
+    deadline = time.time() + wait_ms / 1000.0
+    while time.time() < deadline:
+        try:
+            opts = page.locator(TYPEAHEAD_OPTION_SEL)
+            count = min(opts.count(), 20)
+            found: list[tuple[int, str]] = []
+            for i in range(count):
+                try:
+                    text = re.sub(r"\s+", " ", opts.nth(i).inner_text(timeout=500) or "").strip()
+                except Exception:
+                    continue
+                if not text or re.match(
+                    r"^(no options|no results|loading|searching|type to search)", text, re.I
+                ):
+                    continue
+                found.append((i, text))
+            if found:
+                return found
+        except Exception:
+            pass
+        _sleep(120)
+    return []
+
+
+def fill_typeahead_smart(
+    page,
+    *,
+    field_id: str = "",
+    label: str = "",
+    value: str,
+    accept_top: bool = True,
+) -> bool:
+    """
+    Dynamic dropdown (location, school, long lists): type only a short word,
+    then click the suggestion that best matches the full answer. A single
+    suggestion is clicked directly.
+    """
+    answer = str(value or "").strip()
+    if not answer:
+        return False
+    page.bring_to_front()
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+    target = _locate_field_input(page, field_id, label)
+    if target is None:
+        return False
+    try:
+        is_select = "select__input" in (target.get_attribute("class") or "")
+    except Exception:
+        is_select = False
+
+    def focus_target() -> bool:
+        try:
+            target.scroll_into_view_if_needed(timeout=2000)
+        except Exception:
+            pass
+        try:
+            if is_select:
+                ctrl = target.locator("xpath=ancestor::div[contains(@class,'select__control')][1]")
+                if ctrl.count() > 0:
+                    ctrl.first.click(timeout=2000)
+                    return True
+            target.click(timeout=2000)
+            return True
+        except Exception:
+            try:
+                target.focus()
+                return True
+            except Exception:
+                return False
+
+    def committed() -> bool:
+        try:
+            if is_select:
+                return bool(
+                    target.evaluate(
+                        """(el) => {
+                          const shell = el.closest('.select-shell, .select, .select__container');
+                          const cur = shell && shell.querySelector('.select__single-value, .select__multi-value');
+                          return !!(cur && (cur.textContent || '').trim());
+                        }"""
+                    )
+                )
+            return bool((target.input_value(timeout=800) or "").strip())
+        except Exception:
+            return False
+
+    def type_query(query: str, wait_ms: int = 5000) -> list[tuple[int, str]] | None:
+        if not focus_target():
+            return None
+        try:
+            page.keyboard.press("Control+A")
+            page.keyboard.press("Backspace")
+        except Exception:
+            pass
+        _sleep(60)
+        try:
+            target.press_sequentially(query, delay=60)
+        except Exception:
+            try:
+                page.keyboard.type(query, delay=60)
+            except Exception:
+                return None
+        return _visible_typeahead_options(page, wait_ms=wait_ms)
+
+    def click_option(option: tuple[int, str]) -> bool:
+        try:
+            page.locator(TYPEAHEAD_OPTION_SEL).nth(option[0]).click(timeout=2000, force=True)
+        except Exception:
+            try:
+                page.keyboard.press("ArrowDown")
+                page.keyboard.press("Enter")
+            except Exception:
+                return False
+        _sleep(200)
+        return committed()
+
+    def best_of(options: list[tuple[int, str]]) -> tuple[tuple[int, str], float]:
+        best = max(options, key=lambda item: _typeahead_score(answer, item[1]))
+        return best, _typeahead_score(answer, best[1])
+
+    queries = _typeahead_queries(answer)
+    fallback_query = ""
+    for query in queries:
+        options = type_query(query)
+        if options is None:
+            return False
+        if not options:
+            continue
+        best, score = best_of(options)
+        if len(options) == 1 or score >= 0.75:
+            if click_option(best if len(options) > 1 else options[0]):
+                return True
+            continue
+        if accept_top:
+            if click_option(best if score > 0 else options[0]):
+                return True
+            continue
+        fallback_query = fallback_query or query
+
+    # Weak matches only: go back to the first chunk that had suggestions.
+    # No suggestions at all: the search API may just be slow — retry once.
+    retry_query = fallback_query or (queries[0] if queries else "")
+    if retry_query:
+        options = type_query(retry_query, wait_ms=8000) or []
+        if options:
+            best, score = best_of(options)
+            if click_option(best if score > 0 else options[0]):
+                return True
+
+    # No suggestions at all: plain text inputs just take the full answer.
+    if not is_select:
+        try:
+            target.fill(answer)
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+    return False
+
+
+def fill_single_checkbox(page, field_id: str, label: str) -> bool:
+    try:
+        return bool(
+            page.evaluate(
+                """({ id, label }) => {
+                  const clean = (t) => (t || '').replace(/\\*/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                  let box = null;
+                  if (id) {
+                    box = document.getElementById(id)
+                      || document.querySelector('input[type="checkbox"][data-gh-q="' + CSS.escape(id) + '"]');
+                  }
+                  if (!box && label) {
+                    const want = clean(label);
+                    for (const b of document.querySelectorAll('input[type="checkbox"]')) {
+                      const lab = (b.id && document.querySelector('label[for="' + CSS.escape(b.id) + '"]'))
+                        || (b.closest('.field-wrapper') || {}).querySelector?.('label');
+                      if (lab && clean(lab.textContent) === want) { box = b; break; }
+                    }
+                  }
+                  if (!box || box.type !== 'checkbox') return false;
+                  if (!box.checked) box.click();
+                  return box.checked;
+                }""",
+                {"id": field_id, "label": label},
+            )
+        )
+    except Exception:
+        return False
+
+
+def fill_country_selects(page, preferred: str = "United States") -> dict[str, Any]:
+    """
+    Phone "Country" react-select (and any other select labeled exactly Country):
+    open it and take the first item — or the preferred country if it is listed.
+    """
+    log: list[str] = []
+    try:
+        count = int(
+            page.evaluate(
+                """() => {
+                  const clean = (t) => (t || '').replace(/\\*/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                  let n = 0;
+                  for (const input of document.querySelectorAll('input.select__input')) {
+                    const wrap = input.closest('.field-wrapper, .select__container, .select-shell, .select');
+                    const lab = (input.id && document.querySelector('label[for="' + CSS.escape(input.id) + '"]'))
+                      || (wrap && wrap.querySelector('label, .label'));
+                    const text = clean(lab && lab.textContent);
+                    if (input.id !== 'country' && text !== 'country') continue;
+                    const shell = input.closest('.select-shell, .select, .select__container');
+                    const cur = shell && shell.querySelector('.select__single-value');
+                    if (cur && (cur.textContent || '').trim()) continue;
+                    input.setAttribute('data-gh-country', String(n));
+                    n += 1;
+                  }
+                  return n;
+                }"""
+            )
+            or 0
+        )
+    except Exception as error:
+        return {"filled": 0, "log": [f"Country scan failed: {error}"]}
+
+    want = re.compile(rf"^{re.escape(preferred)}\s*(\(?\+\d+\)?)?$", re.I)
+    filled = 0
+    for idx in range(count):
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        try:
+            inp = page.locator(f'input.select__input[data-gh-country="{idx}"]').first
+            ctrl = inp.locator(
+                "xpath=ancestor::div[contains(@class,'select__control')][1]"
+            ).first
+            opts = page.locator(".select__menu .select__option")
+            for opener in (ctrl, inp):
+                opener.scroll_into_view_if_needed(timeout=2000)
+                opener.click(timeout=2500)
+                try:
+                    opts.first.wait_for(state="attached", timeout=2500)
+                    break
+                except Exception:
+                    try:
+                        page.keyboard.press("ArrowDown")
+                        opts.first.wait_for(state="attached", timeout=1000)
+                        break
+                    except Exception:
+                        continue
+            opts.first.wait_for(state="attached", timeout=500)
+            pick = 0
+            for i in range(min(opts.count(), 300)):
+                text = re.sub(r"\s+", " ", opts.nth(i).inner_text(timeout=300) or "").strip()
+                if want.match(text):
+                    pick = i
+                    break
+            chosen = re.sub(r"\s+", " ", opts.nth(pick).inner_text(timeout=500) or "").strip()
+            opts.nth(pick).click(timeout=2000, force=True)
+            _sleep(150)
+            filled += 1
+            log.append(f"Country select: {chosen}")
+        except Exception as error:
+            log.append(f"Country select failed: {error}")
+    return {"filled": filled, "log": log}
+
+
+PREFILL_CONTACT_JS = """(data) => {
+  const clean = (t) => (t || '').replace(/\\*/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
+  function setNativeValue(el, value) {
+    const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, value);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.dispatchEvent(new Event('blur', { bubbles: true }));
+  }
+  function labelOf(input) {
+    if (input.id) {
+      const byFor = document.querySelector('label[for="' + CSS.escape(input.id) + '"]');
+      if (byFor) return clean(byFor.textContent);
+    }
+    const wrap = input.closest('.field-wrapper, .input-wrapper, .field');
+    const lab = wrap && wrap.querySelector('label, .label');
+    return clean(lab ? lab.textContent : input.getAttribute('aria-label'));
+  }
+  const log = [];
+  const email = document.getElementById('email')
+    || document.querySelector("input[type='email']");
+  if (email && data.email) { setNativeValue(email, data.email); log.push('Filled email'); }
+  const phone = document.getElementById('phone')
+    || document.querySelector("input[type='tel']");
+  if (phone && data.phone) { setNativeValue(phone, data.phone); log.push('Filled phone ' + data.phone); }
+  if (data.linkedin) {
+    for (const input of document.querySelectorAll("input[type='text'], input[type='url'], input:not([type])")) {
+      if (input.classList.contains('select__input') || input.closest('.iti')) continue;
+      if (!/linkedin/.test(labelOf(input))) continue;
+      if ((input.value || '').trim()) continue;
+      setNativeValue(input, data.linkedin);
+      log.push('Filled LinkedIn');
+    }
+  }
+  return { log, iti: !!document.querySelector('.iti, .intl-tel-input') };
+}"""
+
+
+def prefill_contact_fields(page, personal: dict[str, Any]) -> dict[str, Any]:
+    """
+    The only prefill before DeepSeek: email, phone (no country code),
+    phone Country (first item), and LinkedIn.
+    """
+    page.bring_to_front()
+    # Values set before the form hydrates get wiped by React.
+    try:
+        page.wait_for_function(
+            """() => {
+              const el = document.getElementById('email') || document.querySelector("input[type='email']");
+              return !!el && Object.keys(el).some(
+                (k) => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$')
+              );
+            }""",
+            timeout=15000,
+        )
+    except Exception:
+        pass
+    data = {
+        "email": str(personal.get("email") or "").strip(),
+        "phone": _phone_national(str(personal.get("phone") or "")),
+        "linkedin": str(personal.get("linkedin") or "").strip(),
+    }
+    result = page.evaluate(PREFILL_CONTACT_JS, data) or {}
+    log = list(result.get("log") or [])
+
+    country = fill_country_selects(page, str(personal.get("country") or "United States"))
+    log.extend(country.get("log") or [])
+    has_country_select = bool(
+        page.evaluate("() => !!document.querySelector('input.select__input#country')")
+    )
+    if result.get("iti") and not has_country_select:
+        ok = fill_phone_country_playwright(
+            page, str(personal.get("country") or ""), str(personal.get("phone") or "")
+        )
+        log.append("Phone dialer country: " + ("ok" if ok else "failed"))
+
+    # Verify with trusted typing if a re-render dropped the JS-set values.
+    for selector, want, digits_only in (
+        ("#email", data["email"], False),
+        ("#phone", data["phone"], True),
+    ):
+        if not want:
+            continue
+        loc = page.locator(selector).first
+        try:
+            if loc.count() == 0:
+                continue
+            current = loc.input_value(timeout=1000) or ""
+            same = (
+                re.sub(r"\D", "", current).endswith(want)
+                if digits_only
+                else current.strip().lower() == want.lower()
+            )
+            if not same:
+                loc.fill(want)
+                log.append(f"Re-filled {selector}")
+        except Exception as error:
+            log.append(f"Verify {selector} failed: {error}")
+    return {"ok": True, "log": log}
+
+
+COVER_LETTER_STATE_JS = """() => {
+  const group = document.querySelector("[aria-labelledby='upload-label-cover_letter']")
+    || (document.getElementById('cover_letter') || { closest: () => null }).closest('.file-upload');
+  if (!group) return { present: false, required: false, filled: false };
+  const label = document.getElementById('upload-label-cover_letter');
+  const required = group.getAttribute('aria-required') === 'true'
+    || /\\*/.test((label && label.textContent) || '')
+    || !!group.querySelector('#cover_letter[required]');
+  const area = document.getElementById('cover_letter_text') || group.querySelector('textarea');
+  const file = document.getElementById('cover_letter');
+  const filled = !!((area && (area.value || '').trim()) || (file && file.files && file.files.length));
+  return { present: true, required, filled };
+}"""
+
+
+def cover_letter_state(page) -> dict[str, Any]:
+    try:
+        return page.evaluate(COVER_LETTER_STATE_JS) or {}
+    except Exception:
+        return {"present": False, "required": False, "filled": False}
+
+
+def fill_cover_letter_text(page, text: str) -> bool:
+    """Click "Enter manually" under Cover Letter and paste the letter."""
+    body = str(text or "").strip()
+    if not body:
+        return False
+    page.bring_to_front()
+    area_sel = (
+        "#cover_letter_text, textarea[name='cover_letter_text'], "
+        "[aria-labelledby='upload-label-cover_letter'] textarea"
+    )
+    area = page.locator(area_sel).first
+    try:
+        visible = area.count() > 0 and area.is_visible()
+    except Exception:
+        visible = False
+    if not visible:
+        btn = page.locator("button[data-testid='cover_letter-text']")
+        if btn.count() == 0:
+            btn = page.locator(
+                "[aria-labelledby='upload-label-cover_letter'] button:has-text('Enter manually')"
+            )
+        if btn.count() == 0:
+            return False
+        try:
+            btn.first.scroll_into_view_if_needed(timeout=2000)
+            btn.first.click(timeout=3000)
+        except Exception:
+            return False
+        area = page.locator(area_sel).first
+        try:
+            area.wait_for(state="visible", timeout=5000)
+        except Exception:
+            area = page.locator(
+                "xpath=//*[@id='upload-label-cover_letter']/following::textarea[1]"
+            ).first
+            try:
+                area.wait_for(state="visible", timeout=2000)
+            except Exception:
+                return False
+    try:
+        area.scroll_into_view_if_needed(timeout=2000)
+        area.fill(body)
+        _sleep(150)
+        return len((area.input_value(timeout=1000) or "").strip()) > 0
+    except Exception:
+        return False
+
+
 def collect_questions(
     page,
     *,
@@ -1981,7 +2558,14 @@ def collect_questions(
     dropdown_rules: list[dict[str, Any]] | None = None,
     checkbox_rules: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Collect only required (*) Greenhouse questions that still need answers."""
+    """
+    Collect required (*) Greenhouse questions that still need answers.
+
+    Per question:
+      - kind "typeahead" for location / school style search boxes and huge lists
+      - "autoValue" when there is only one possible option (click without asking)
+      - "ruleValue" from dropdown/checkbox rules — fallback only, never prefilled
+    """
     page.bring_to_front()
     _sleep(80)
     questions = page.evaluate(COLLECT_QUESTIONS_JS) or []
@@ -1992,31 +2576,36 @@ def collect_questions(
         and str(q.get("label") or "").strip()
         and not re.match(r"^select\.?\.?\.?$", str(q.get("label") or "").strip(), re.I)
     ]
-    # Opening every dropdown is slow — only do it when DeepSeek must pick,
-    # and skip selects already covered by dropdownRules (Yes/No etc.).
-    # Prefer choices already scraped from .question-description when usable.
     for question in questions:
         kind = str(question.get("kind") or "")
         label = str(question.get("label") or "").strip()
+        if kind == "single_checkbox":
+            question["autoValue"] = label
+            continue
         if kind == "checkbox":
             ruled = _rule_value_for_label(label, checkbox_rules)
             if ruled is not None:
                 question["ruleValue"] = ruled
-            question.setdefault("choices", list(question.get("choices") or []))
+            choices = list(question.get("choices") or [])
+            question["choices"] = choices
+            if len(choices) == 1:
+                question["autoValue"] = choices[0]
+            continue
+        if kind != "textarea" and is_typeahead_label(label):
+            question["kind"] = "typeahead"
+            question["choices"] = []
             continue
         if kind != "select":
             question.setdefault("choices", [])
             continue
         ruled = _rule_value_for_label(label, dropdown_rules)
         if ruled is not None:
-            question["choices"] = []
             question["ruleValue"] = ruled
-            continue
         if not read_choices:
             question["choices"] = []
             continue
         desc_choices = _desc_choices_usable(label, list(question.get("choices") or []))
-        if desc_choices:
+        if len(desc_choices) >= 2:
             question["choices"] = desc_choices
             continue
         field_id = str(question.get("id") or question.get("name") or "").strip()
@@ -2030,7 +2619,19 @@ def collect_questions(
         choices = [str(c).strip() for c in choices if str(c).strip()]
         if not choices:
             choices = _read_choices_playwright(page, field_id, label)
-        question["choices"] = choices
+        choices = [
+            c for c in choices
+            if not re.match(r"^(no options|loading|searching|type to search)", c, re.I)
+        ]
+        if not choices or len(choices) > TYPEAHEAD_MAX_CHOICES:
+            # Async search select (school) or a huge list (discipline):
+            # type a short chunk and pick the best suggestion instead.
+            question["kind"] = "typeahead"
+            question["choices"] = []
+        else:
+            question["choices"] = choices
+            if len(choices) == 1:
+                question["autoValue"] = choices[0]
         _sleep(40)
     return questions
 
@@ -2160,12 +2761,42 @@ def apply_gap_answers(
                 for k, v in answers.items()
             ]
 
+    log: list[str] = []
+    missed: list[str] = []
+    filled = 0
+
+    # Dynamic dropdowns: short chunk + best suggestion. Lone checkboxes: click.
+    special = {"typeahead", "single_checkbox"}
+    for item in items:
+        kind = str(item.get("kind") or "").lower()
+        if kind not in special:
+            continue
+        label = str(item.get("label") or "").strip()
+        field_id = str(item.get("name") or item.get("id") or "").strip()
+        answer = str(item.get("answer") or "").strip()
+        if kind == "single_checkbox":
+            ok = fill_single_checkbox(page, field_id, label)
+        else:
+            ok = fill_typeahead_smart(
+                page,
+                field_id=field_id,
+                label=label,
+                value=answer,
+                accept_top=bool(re.search(r"locat|city", label, re.I)),
+            )
+        if ok:
+            filled += 1
+            log.append(f"{kind}: {label} = {answer[:60]}")
+        else:
+            missed.append(label)
+    items = [i for i in items if str(i.get("kind") or "").lower() not in special]
+
     # Text fields via JS first (fast).
-    js_result = page.evaluate(APPLY_GAPS_JS, items) or {}
-    missed = list(js_result.get("missed") or [])
+    js_result = (page.evaluate(APPLY_GAPS_JS, items) or {}) if items else {}
+    missed.extend(js_result.get("missed") or [])
     pw: dict[str, Any] = {"filled": 0, "log": [], "labels": []}
-    log = list(js_result.get("log") or [])
-    filled = int(js_result.get("filled") or 0)
+    log.extend(js_result.get("log") or [])
+    filled += int(js_result.get("filled") or 0)
 
     # Checkbox groups: Playwright/DOM click commit.
     for item in items:
@@ -2183,25 +2814,6 @@ def apply_gap_answers(
             missed = [m for m in missed if str(m).strip().lower() != label.lower()]
         elif label not in missed:
             missed.append(label)
-
-    # Education typeaheads among gap answers.
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        label = str(item.get("label") or "").strip()
-        answer = str(item.get("answer") or "").strip()
-        if not answer:
-            continue
-        if not re.search(
-            r"school name|^school\b|university|college|degree|discipline|major|field of study",
-            label,
-            re.I,
-        ):
-            continue
-        if fill_typeahead_playwright(page, re.escape(label[:40]), answer):
-            filled += 1
-            log.append(f"Education PW: {label} = {answer}")
-            missed = [m for m in missed if str(m).strip().lower() != label.lower()]
 
     # ALWAYS re-commit dropdowns with Playwright trusted clicks.
     # Greenhouse react-select often opens/highlights but never sticks via JS-only clicks.
@@ -2543,6 +3155,67 @@ def detect_submission_success(page) -> bool:
         return False
 
 
+def detect_validation_errors(page) -> list[str]:
+    """Visible Greenhouse validation messages that block a real submit."""
+    try:
+        raw = page.evaluate(
+            """() => {
+              const clean = (t) => (t || "").replace(/\\s+/g, " ").trim();
+              const out = [];
+              const seen = new Set();
+              const push = (t) => {
+                const s = clean(t);
+                if (!s || s.length < 3 || s.length > 180) return;
+                const key = s.toLowerCase();
+                if (seen.has(key)) return;
+                seen.add(key);
+                out.push(s);
+              };
+              for (const el of document.querySelectorAll(
+                ".error, .field-error, .input__error, .select__error, [role='alert'], [aria-invalid='true']"
+              )) {
+                if (!el.getClientRects().length) continue;
+                const t = el.getAttribute("aria-invalid") === "true"
+                  ? (el.getAttribute("aria-errormessage")
+                     || el.getAttribute("aria-describedby")
+                     || el.getAttribute("aria-label")
+                     || el.textContent)
+                  : el.textContent;
+                if (el.getAttribute("aria-invalid") === "true" && (!t || t === "true")) {
+                  const wrap = el.closest(".field-wrapper, .input-wrapper, .field, .select__container");
+                  const lab = wrap && wrap.querySelector("label");
+                  push((lab ? lab.textContent : "Field") + ": required");
+                  continue;
+                }
+                push(t);
+              }
+              for (const el of document.querySelectorAll(
+                ".field-wrapper .error, .field-wrapper [class*='error'], p.error, span.error, div.error"
+              )) {
+                if (el.getClientRects().length) push(el.textContent);
+              }
+              // Required empties still on the form after a failed submit.
+              for (const wrap of document.querySelectorAll(".field-wrapper")) {
+                const lab = wrap.querySelector("label, legend");
+                const label = clean(lab && lab.textContent);
+                if (!label || !/\\*/.test(label)) continue;
+                const input = wrap.querySelector(
+                  "textarea, input.input, input[type='text'], input:not([type]), input.select__input"
+                );
+                if (!input || input.type === "hidden" || input.type === "file") continue;
+                const empty = input.classList.contains("select__input")
+                  ? !wrap.querySelector(".select__single-value, .select__multi-value")
+                  : !(input.value || "").trim();
+                if (empty) push(label.replace(/\\*/g, "").trim() + " is required");
+              }
+              return out.slice(0, 12);
+            }"""
+        )
+        return [str(x) for x in (raw or []) if str(x).strip()]
+    except Exception:
+        return []
+
+
 def detect_security_code_field(page) -> dict[str, Any]:
     return page.evaluate(
         """(script) => {
@@ -2666,7 +3339,13 @@ def build_greenhouse_profile(personal: dict[str, Any], options: dict[str, Any] |
             else _education_from_payload(personal)
         ),
         "textRules": [
+            # More-specific name variants first (matchRule is includes-order).
             {"includes": "preferred first name", "field": "preferredName"},
+            {"includes": "preferred last name", "field": "lastName"},
+            {"includes": "legal first name", "field": "firstName"},
+            {"includes": "legal last name", "field": "lastName"},
+            {"includes": "legal given name", "field": "firstName"},
+            {"includes": "legal family name", "field": "lastName"},
             {"includes": "linkedin", "field": "linkedin"},
             {"includes": "website", "field": "website"},
             {"includes": "portfolio", "field": "website"},
