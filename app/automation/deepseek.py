@@ -176,6 +176,31 @@ CONTINUE_REPLY_JS = """() => {
           return null;
         }"""
 
+RETRY_FAILED_JS = """() => {
+          // "Failed to load this message" + Retry (network drop mid-generation).
+          const clean = (t) => (t || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+          const buttons = Array.from(document.querySelectorAll('.ds-button, button, [role="button"]'))
+            .filter((btn) => {
+              const label = clean(btn.querySelector('.ds-button__content')?.textContent || btn.textContent);
+              if (label !== 'retry') return false;
+              const rect = btn.getBoundingClientRect();
+              const style = window.getComputedStyle(btn);
+              if (!(rect.width > 0 && rect.height > 0) || style.visibility === 'hidden' || style.display === 'none') {
+                return false;
+              }
+              let node = btn.parentElement;
+              for (let hop = 0; hop < 4 && node; hop += 1, node = node.parentElement) {
+                if (/failed to load this message|network error|server busy/.test(clean(node.textContent))) return true;
+              }
+              return false;
+            });
+          const btn = buttons[buttons.length - 1];
+          if (!btn) return false;
+          btn.scrollIntoView({ block: 'center' });
+          btn.click();
+          return true;
+        }"""
+
 PAGE_STATE_JS = """() => {
               // Only treat a visible Stop/Abort control as "still generating".
               // Broad [class*=stop] matches false-positives and can hang waiters.
@@ -509,6 +534,23 @@ def click_continue_or_reply(page) -> str | None:
     return page.evaluate(CONTINUE_REPLY_JS)
 
 
+_retry_clicked_at: dict[int, float] = {}
+
+
+def click_retry_if_failed(page, cooldown_s: float = 4.0) -> bool:
+    """Click Retry on a "Failed to load this message" reply. True when clicked."""
+    key = id(page)
+    if time.time() - _retry_clicked_at.get(key, 0.0) < cooldown_s:
+        return False
+    try:
+        clicked = bool(page.evaluate(RETRY_FAILED_JS))
+    except Exception:
+        return False
+    if clicked:
+        _retry_clicked_at[key] = time.time()
+    return clicked
+
+
 def extract_json_candidate(text: str) -> dict[str, Any] | None:
     return parse_resume_json(text or "")
 
@@ -702,6 +744,13 @@ def run_deepseek_chat(
         # Only poke Continue while DeepSeek is still generating / truncated.
         if stopping:
             click_continue_or_reply(page)
+        if click_retry_if_failed(page):
+            # Regenerating from scratch — drop any half-received JSON.
+            ready_since = None
+            last_ready_fingerprint = ""
+            quiet_since = time.time()
+            _sleep(1500)
+            continue
 
         # Prefer assistant reply text, then whole-page / code-block extraction.
         candidate = None
@@ -1160,6 +1209,12 @@ def ask_deepseek_gaps(
         stopping = bool(state.get("stopping"))
         if stopping:
             click_continue_or_reply(page)
+        if click_retry_if_failed(page):
+            best = {}
+            last_reply = ""
+            quiet_since = time.time()
+            _sleep(1500)
+            continue
 
         reply = (state.get("reply") or "").strip()
         answer_count = int(state.get("answerCount") or 0)
@@ -1233,6 +1288,9 @@ def ask_deepseek_pick_option(
         except Exception:
             _sleep(500)
             continue
+        if click_retry_if_failed(page):
+            _sleep(1500)
+            continue
         if int(state.get("answerCount") or 0) <= before_answers or state.get("stopping"):
             _sleep(400)
             continue
@@ -1301,6 +1359,12 @@ def ask_deepseek_cover_letter(page, timeout_s: float = 180) -> str:
             _sleep(500)
             continue
         stopping = bool(state.get("stopping"))
+        if click_retry_if_failed(page):
+            # A half-streamed letter must not be pasted.
+            last_code = ""
+            stable_since = time.time()
+            _sleep(1500)
+            continue
         if int(state.get("answerCount") or 0) <= before_answers:
             _sleep(500)
             continue
