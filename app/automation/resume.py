@@ -50,17 +50,29 @@ class ResumeBridge:
             time.sleep(1.2)
 
     def is_main_py_running(self) -> bool:
+        # tasklist only prints the image name, never the script, so it cannot
+        # tell a running main.py from any other python.exe. That check always
+        # failed and a second watcher was started beside the one already open.
+        if self.child and self.child.poll() is None:
+            return True
+
         try:
             result = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq python.exe", "/FO", "CSV", "/NH"],
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" "
+                    "| Select-Object -ExpandProperty CommandLine",
+                ],
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=15,
             )
-            text = (result.stdout or "").lower()
-            return "main.py" in text or bool(self.child and self.child.poll() is None)
+            return "main.py" in (result.stdout or "")
         except Exception:
-            return bool(self.child and self.child.poll() is None)
+            return False
 
     def output_root(self) -> Path:
         return Path(self.settings.get("resumeOutputDir") or ".")
