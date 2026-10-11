@@ -13,11 +13,17 @@ def main() -> int:
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
+    from app.automation.resume_server import start_resume_server, stop_resume_server
+
+    start_resume_server(615)
+
     app = QApplication(sys.argv)
     app.setApplicationName("Greenhouse Auto Apply")
     window = MainWindow(root / ".app-data")
     window.show()
-    return app.exec_()
+    code = app.exec_()
+    stop_resume_server()
+    return code
 
 
 if __name__ == "__main__":

@@ -54,6 +54,7 @@ from app.automation.greenhouse import (
 )
 from app.automation.outlook_web_otp import wait_for_security_code_with_fallback
 from app.automation.resume import ResumeBridge
+from app.automation.resume_server import start_resume_server
 
 MAX_SUBMIT_ATTEMPTS = 8
 
@@ -245,6 +246,7 @@ class Runner:
         self._contexts: list[Any] = []
         self._browsers: list[Any] = []
         self._contexts_lock = threading.Lock()
+        start_resume_server(int(settings.get("resumeServerPort") or 615))
         self.resume_bridge = ResumeBridge(settings)
         self.profiles_json = load_profiles_json(settings["profilesJsonPath"])
 
@@ -784,9 +786,9 @@ class Runner:
                             or ""
                         )
 
-                        # Stay on DeepSeek while Word builds the PDF.
+                        # Stay on DeepSeek while resume builds.
                         url_item["state"] = "waiting for resume"
-                        self.set_job_state(profile_id, jobs, "waiting for resume")
+                        self.set_job_state(profile_id, jobs, "waiting for resume (localhost:615)")
                         focus_page(deepseek_page)
 
                         resume_started = time.time()
@@ -795,18 +797,27 @@ class Runner:
                             payload=payload,
                             raw_text=raw,
                             company=company,
+                            role=str(job.get("title") or ""),
+                            started_at=resume_started,
                             on_status=lambda msg: self.set_job_state(profile_id, jobs, msg),
+                            stop_requested=lambda: self.stop_requested,
                         )
-                        matched = self.resume_bridge.find_resume_pdf(
-                            name, company=company, after_ts=resume_started
-                        )
-                        if matched:
-                            pdf_path = matched
+                        if not pdf_path or not Path(pdf_path).exists():
+                            # If path came from localhost:615 but has not settled on disk yet
+                            if pdf_path:
+                                wait_file = time.time()
+                                while not Path(pdf_path).exists() and time.time() - wait_file < 6.0:
+                                    time.sleep(0.3)
+                        if not pdf_path or not Path(pdf_path).exists():
+                            matched = self.resume_bridge.find_resume_pdf(
+                                name, company=company, after_ts=resume_started
+                            )
+                            if matched:
+                                pdf_path = matched
                         if not pdf_path or not Path(pdf_path).exists():
                             raise RuntimeError(
-                                f'Resume PDF was not created for "{name}". '
-                                "Check Paths → Resume main.py / Python for main.py, "
-                                "and that templates/<name>.docx exists."
+                                f'Resume PDF was not found at "{pdf_path}". '
+                                "Expected notification on localhost:615 with resume location."
                             )
 
                         resume_folder = str(Path(pdf_path).resolve().parent)

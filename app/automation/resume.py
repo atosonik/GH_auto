@@ -12,6 +12,11 @@ from typing import Any, Callable
 
 import pyperclip
 
+from app.automation.resume_server import (
+    start_resume_server,
+    wait_for_resume_notification,
+)
+
 # Serialize resume builds — Word/COM + clipboard cannot run safely in parallel.
 _GENERATE_LOCK = threading.Lock()
 
@@ -130,50 +135,62 @@ class ResumeBridge:
         payload: dict[str, Any] | None,
         raw_text: str = "",
         company: str = "",
+        role: str = "",
+        started_at: float | None = None,
         on_status: Callable[[str], None] | None = None,
-        timeout_ms: int = 240000,
+        timeout_ms: int = 300000,
+        stop_requested: Callable[[], bool] | None = None,
     ) -> str:
         """
-        Build a PDF without fighting over the clipboard across profiles.
-        Uses a subprocess call into bid/main.py.generate_resume when possible.
+        Notify/copy resume payload and wait for localhost:615 server
+        notification with the resume file location.
         """
-        if on_status:
-            on_status("generating resume")
+        port = int(self.settings.get("resumeServerPort") or 615)
+        start_resume_server(port)
 
-        started = time.time()
+        started = started_at or time.time()
         company = company or ((payload or {}).get("target") or {}).get("company") or ""
+        role = role or ((payload or {}).get("target") or {}).get("role") or ""
 
-        last_error = ""
+        # Copy JSON to clipboard so external generators / watchers can pick it up
+        text = raw_text
+        if payload is not None:
+            text = json.dumps(payload, indent=2, ensure_ascii=False)
+        if text:
+            try:
+                pyperclip.copy(text)
+            except Exception:
+                pass
+
+        if on_status:
+            on_status(f"waiting for resume on localhost:{port}")
+
         with _GENERATE_LOCK:
             try:
-                pdf = self._generate_direct(payload, raw_text, timeout_ms=timeout_ms)
-            except Exception as error:
-                last_error = str(error)
-                pdf = None
-            if pdf and Path(pdf).exists():
-                return pdf
-
-            # Clipboard fallback (serialized by the same lock).
-            if on_status:
-                on_status("waiting for resume")
-            text = raw_text
-            if payload is not None:
-                text = json.dumps(payload, indent=2, ensure_ascii=False)
-            try:
-                pdf = self.copy_and_wait(
-                    profile_name,
-                    text,
-                    timeout_ms=min(timeout_ms, 180000),
+                notif = wait_for_resume_notification(
+                    name=profile_name,
+                    company=company,
+                    role=role,
+                    started_at=started,
+                    timeout_s=max(10.0, timeout_ms / 1000.0),
                     on_status=on_status,
+                    stop_requested=stop_requested,
                 )
+                resume_path = notif.get("resume_path") or ""
+                if resume_path:
+                    return resume_path
             except Exception as error:
-                detail = last_error or str(error)
+                # Fallback: check if direct generation or output directory caught it
+                matched = self.find_resume_pdf(profile_name, company=company, after_ts=started)
+                if matched:
+                    return matched
                 raise RuntimeError(
-                    f'Could not generate resume PDF for "{profile_name}". {detail}'
+                    f'Resume notification not received on localhost:{port} for "{profile_name}". {error}'
                 ) from error
 
-        matched = self.find_resume_pdf(profile_name, company=company, after_ts=started)
-        return matched or pdf
+        raise RuntimeError(
+            f'Resume notification not received on localhost:{port} for "{profile_name}".'
+        )
 
     def _generate_direct(
         self,

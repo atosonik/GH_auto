@@ -14,6 +14,7 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QGraphicsDropShadowEffect,
@@ -156,20 +157,20 @@ class GradientBackground(QWidget):
 class SettingsDialog(QDialog):
     def __init__(self, settings: dict[str, Any], stylesheet: str, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Paths & tools")
+        self.setWindowTitle("Settings")
         self.setModal(True)
-        self.resize(640, 520)
+        self.resize(600, 240)
         self.setStyleSheet(stylesheet)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 22, 24, 18)
         root.setSpacing(14)
 
-        title = QLabel("Paths & tools")
+        title = QLabel("Settings")
         title.setObjectName("sectionTitle")
         root.addWidget(title)
 
-        hint = QLabel("Theme, browser mode, and project paths. Browser mode controls whether Greenhouse uses private Chrome copies or your live profiles.")
+        hint = QLabel("Theme, browser mode, and Chrome extension folder.")
         hint.setObjectName("sectionHint")
         hint.setWordWrap(True)
         root.addWidget(hint)
@@ -209,20 +210,20 @@ class SettingsDialog(QDialog):
         form = QFormLayout()
         form.setSpacing(12)
         form.setLabelAlignment(Qt.AlignLeft)
-        self.inputs: dict[str, QLineEdit] = {}
-        fields = [
-            ("chromeUserDataDir", "Chrome User Data"),
-            ("promptsDir", "Prompts folder"),
-            ("profileContextDir", "Profile context folder"),
-            ("profilesJsonPath", "profiles.json"),
-            ("mainPyPath", "Resume main.py"),
-            ("resumeOutputDir", "Resume output"),
-            ("pythonPath", "Python for main.py"),
-        ]
-        for key, label in fields:
-            edit = QLineEdit(str(settings.get(key, "")))
-            self.inputs[key] = edit
-            form.addRow(label, edit)
+
+        ext_row = QHBoxLayout()
+        ext_row.setSpacing(8)
+        cur_ext = str(settings.get("extensionDir") or "")
+        if not cur_ext and settings.get("promptsDir"):
+            cur_ext = str(Path(settings["promptsDir"]).parent)
+        self.extension_dir_edit = QLineEdit(cur_ext)
+        self.extension_dir_edit.setPlaceholderText(r"D:\3.Work\Develop\bid\extension-deepseek")
+        browse_btn = QPushButton("Browse...")
+        browse_btn.setObjectName("ghost")
+        browse_btn.clicked.connect(self._browse_extension_dir)
+        ext_row.addWidget(self.extension_dir_edit, 1)
+        ext_row.addWidget(browse_btn)
+        form.addRow("Extension folder", ext_row)
         root.addLayout(form)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
@@ -230,10 +231,24 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
+    def _browse_extension_dir(self) -> None:
+        initial = self.extension_dir_edit.text().strip()
+        directory = QFileDialog.getExistingDirectory(self, "Select Chrome Extension Folder", initial or "")
+        if directory:
+            self.extension_dir_edit.setText(directory)
+
     def values(self) -> dict[str, Any]:
-        data: dict[str, Any] = {key: edit.text().strip() for key, edit in self.inputs.items()}
-        data["theme"] = normalize_theme(self.theme_combo.currentData())
-        data["browserMode"] = self.browser_combo.currentData() or "isolated"
+        ext_dir = self.extension_dir_edit.text().strip()
+        data: dict[str, Any] = {
+            "extensionDir": ext_dir,
+            "theme": normalize_theme(self.theme_combo.currentData()),
+            "browserMode": self.browser_combo.currentData() or "isolated",
+        }
+        if ext_dir:
+            p = Path(ext_dir)
+            data["promptsDir"] = str(p / "prompts")
+            data["profileContextDir"] = str(p / "profile-context")
+            data["profilesJsonPath"] = str(p / "profiles.json")
         return data
 
 
@@ -1016,4 +1031,6 @@ class MainWindow(QMainWindow):
         self.persist()
         if self.running:
             self.bridge.stop()
+        from app.automation.resume_server import stop_resume_server
+        stop_resume_server()
         super().closeEvent(event)

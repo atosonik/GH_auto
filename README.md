@@ -9,8 +9,8 @@ Python desktop app that applies to Greenhouse jobs **per Chrome profile**.
 3. Each window uses 2 tabs: Greenhouse job + `chat.deepseek.com`
 4. Reads the JD → sends profile prompt + JD to DeepSeek  
    (auto-clicks **Continue** / **Reply** when they appear)
-5. Waits for resume JSON → hands it to `D:\3.Work\Develop\bid\main.py` for PDF generation
-6. Fills the Greenhouse form, uploads the PDF, submits
+5. Waits for resume JSON → waits for PDF notification on `localhost:615`
+6. Fills the Greenhouse form, uploads the received PDF, submits
 7. If a security code appears, reads it over IMAP for that profile
 
 ## Setup
@@ -23,11 +23,10 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-Point **Settings** at your bid project paths if they differ from the defaults:
+Point **Settings** at your bid Chrome extension folder:
 
-- prompts dir → `D:\3.Work\Develop\bid\prompts`
-- profiles.json → `D:\3.Work\Develop\bid\extension-deepseek\profiles.json`
-- main.py → `D:\3.Work\Develop\bid\main.py`
+- extension folder → `D:\3.Work\Develop\bid\extension-deepseek`
+  (automatically resolves `prompts/`, `profile-context/`, and `profiles.json`)
 
 Profile **names must match** `profiles.json` / prompt filenames exactly (e.g. `Peter Chu`).
 
