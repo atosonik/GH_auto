@@ -89,6 +89,16 @@ def resolve_resume_location(payload: dict[str, Any]) -> str | None:
     return None
 
 
+class SafeHTTPServer(HTTPServer):
+    # On Windows, allow_reuse_address allows multiple processes to bind to the
+    # same port without an error, but packets only go to the first process.
+    allow_reuse_address = False
+
+
+def _notification_cache_file() -> Path:
+    return Path(__file__).resolve().parents[2] / ".app-data" / "last_resume_notification.json"
+
+
 class ResumeServerManager:
     """
     Manages the background HTTP server on localhost:615 to receive
@@ -174,7 +184,7 @@ class ResumeServerManager:
             # Try 0.0.0.0 first, then 127.0.0.1
             for host in ("0.0.0.0", "127.0.0.1"):
                 try:
-                    server = HTTPServer((host, self.port), ResumeHandler)
+                    server = SafeHTTPServer((host, self.port), ResumeHandler)
                     self._server = server
                     self._running = True
                     break
@@ -232,6 +242,13 @@ class ResumeServerManager:
         with self._lock:
             self._notifications.append(entry)
             self._cond.notify_all()
+
+        try:
+            cache_file = _notification_cache_file()
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(json.dumps(entry, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
 
         return resume_loc
 
@@ -312,6 +329,24 @@ class ResumeServerManager:
                     ]
                     if len(unconsumed) == 1:
                         matched = unconsumed[0]
+
+                # Disk cache fallback (in case notification was handled across instances)
+                if not matched:
+                    try:
+                        cf = _notification_cache_file()
+                        if cf.exists():
+                            item = json.loads(cf.read_text(encoding="utf-8"))
+                            if (
+                                isinstance(item, dict)
+                                and not item.get("consumed")
+                                and item.get("received_at", 0) >= min_ts
+                                and (self._matches(item, name, company, role) or bool(item.get("resume_path")))
+                            ):
+                                matched = item
+                                item["consumed"] = True
+                                cf.write_text(json.dumps(item, indent=2), encoding="utf-8")
+                    except Exception:
+                        pass
 
                 if matched:
                     matched["consumed"] = True
