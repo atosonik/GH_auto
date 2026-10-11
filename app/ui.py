@@ -584,7 +584,7 @@ class MainWindow(QMainWindow):
         top.addWidget(name, 3)
 
         number = QSpinBox()
-        number.setRange(0, 200)
+        number.setRange(0, 500)
         number.setPrefix("Chrome ")
         number.setValue(int(profile.get("chromeProfileNumber") or 0))
         number.setToolTip("Chrome profile index (Profile 12 → 12, Default → 0)")
