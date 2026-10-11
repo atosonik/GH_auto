@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 import pyperclip
 
+from app.automation.deepseek import copy_resume_to_clipboard
 from app.automation.resume_server import (
     start_resume_server,
     wait_for_resume_notification,
@@ -157,10 +158,7 @@ class ResumeBridge:
         if payload is not None:
             text = json.dumps(payload, indent=2, ensure_ascii=False)
         if text:
-            try:
-                pyperclip.copy(text)
-            except Exception:
-                pass
+            copy_resume_to_clipboard(text)
 
         if on_status:
             on_status(f"waiting for resume on localhost:{port}")

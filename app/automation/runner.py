@@ -781,7 +781,7 @@ class Runner:
                                 count=1,
                             )
                         if raw:
-                            copy_resume_to_clipboard(raw)
+                            copy_resume_to_clipboard(raw, page=deepseek_page)
 
                         company = (
                             job.get("company")

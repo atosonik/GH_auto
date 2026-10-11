@@ -236,6 +236,16 @@ PAGE_STATE_JS = """() => {
               const last = nodes.length ? nodes[nodes.length - 1] : null;
               const reply = last ? (last.innerText || last.textContent || '') : '';
               const text = document.body?.innerText || '';
+
+              // DeepSeek mounts an action toolbar with Copy/Retry/Like buttons ONLY when generation finishes.
+              const row = last ? (last.closest('[data-virtual-list-item-key], ._4f9bf79, .ds-message') || last.parentElement) : null;
+              const actionToolbar = Boolean(
+                row && (
+                  row.querySelector('._0a3d93b, ._965abe9, .ds-button--capsule, [class*="action"], [class*="footer"]') ||
+                  row.parentElement?.querySelector('._0a3d93b, ._965abe9, .ds-button--capsule')
+                )
+              );
+
               return {
                 text,
                 size: text.length,
@@ -243,6 +253,7 @@ PAGE_STATE_JS = """() => {
                 replySize: reply.length,
                 answerCount: nodes.length,
                 stopping,
+                actionToolbar,
                 composerLen: (function () {
                   const el =
                     document.querySelector('#prompt-textarea') ||
@@ -617,7 +628,7 @@ def _looks_like_placeholder_resume(payload: dict[str, Any]) -> bool:
     return False
 
 
-def copy_resume_to_clipboard(payload_or_text: dict[str, Any] | str) -> bool:
+def copy_resume_to_clipboard(payload_or_text: dict[str, Any] | str, page=None) -> bool:
     """Save the finished resume JSON to system clipboard."""
     if isinstance(payload_or_text, dict):
         text = json.dumps(payload_or_text, indent=2, ensure_ascii=False)
@@ -626,6 +637,32 @@ def copy_resume_to_clipboard(payload_or_text: dict[str, Any] | str) -> bool:
     if not text:
         return False
 
+    # 1. In browser tab: click DeepSeek's native copy button or use navigator.clipboard
+    if page:
+        try:
+            page.evaluate(
+                """(txt) => {
+                    // Try clicking DeepSeek native copy button first
+                    const roots = Array.from(document.querySelectorAll('.ds-assistant-message-main-content, .ds-message'));
+                    const last = roots.length ? roots[roots.length - 1] : null;
+                    const row = last ? (last.closest('[data-virtual-list-item-key], ._4f9bf79, .ds-message') || last.parentElement) : null;
+                    if (row) {
+                        const copyBtn = row.querySelector('.ds-button, [role="button"]');
+                        if (copyBtn) {
+                            copyBtn.click();
+                            return;
+                        }
+                    }
+                    if (navigator.clipboard && navigator.clipboard.writeText) {
+                        navigator.clipboard.writeText(txt).catch(() => {});
+                    }
+                }""",
+                text,
+            )
+        except Exception:
+            pass
+
+    # 2. Python pyperclip
     try:
         import pyperclip
         pyperclip.copy(text)
@@ -633,10 +670,11 @@ def copy_resume_to_clipboard(payload_or_text: dict[str, Any] | str) -> bool:
     except Exception:
         pass
 
+    # 3. Windows PowerShell Set-Clipboard
     try:
         import subprocess
         subprocess.run(
-            ["powershell", "-NoProfile", "-Command", "Set-Clipboard -Value $input"],
+            ["powershell", "-NoProfile", "-Command", "[Console]::In.ReadToEnd() | Set-Clipboard"],
             input=text,
             text=True,
             timeout=5,
@@ -758,6 +796,7 @@ def run_deepseek_chat(
         reply = state.get("reply") or ""
         reply_size = int(state.get("replySize") or 0)
         stopping = bool(state.get("stopping"))
+        action_toolbar = bool(state.get("actionToolbar"))
         answers = int(state.get("answerCount") or 0)
         composer_len = int(state.get("composerLen") or 0)
 
@@ -796,6 +835,11 @@ def run_deepseek_chat(
             last_reply = reply_size
 
         if candidate:
+            # Immediately copy to clipboard as soon as all required fields are present
+            raw_cand = candidate.get("raw") or ""
+            if raw_cand:
+                copy_resume_to_clipboard(raw_cand, page=page)
+
             fingerprint = str(len(candidate.get("raw") or "")) + ":" + str(
                 (candidate.get("parsed") or {}).get("name") or ""
             )
@@ -807,7 +851,12 @@ def run_deepseek_chat(
 
             ready_for = time.time() - (ready_since or time.time())
             quiet_for = time.time() - quiet_since
-            # Generation finished: no Stop button, composer idle, JSON ready.
+
+            # 1. Action toolbar (Copy / Retry buttons) rendered -> generation finished!
+            if action_toolbar:
+                found = candidate
+                break
+            # 2. Generation finished: no Stop button, composer idle, JSON ready.
             # Keep this snappy — users were waiting 10s+ after JSON appeared.
             if not stopping and ready_for >= 0.25 and quiet_for >= 0.25:
                 found = candidate
@@ -815,11 +864,11 @@ def run_deepseek_chat(
             if not stopping and composer_len == 0 and ready_for >= 0.2:
                 found = candidate
                 break
-            # Some DeepSeek builds leave a Stop-like control stuck visible.
+            # 3. Some DeepSeek builds leave a Stop-like control stuck visible.
             if ready_for >= 1.2 and quiet_for >= 0.6:
                 found = candidate
                 break
-            # Valid complete JSON + not growing: take it even if Stop flickers.
+            # 4. Valid complete JSON + not growing: take it even if Stop flickers.
             if ready_for >= 0.8 and not grew:
                 found = candidate
                 break
@@ -832,7 +881,7 @@ def run_deepseek_chat(
         raise TimeoutError("Timed out waiting for DeepSeek resume JSON")
     if found.get("parsed") and found.get("raw"):
         out_raw = found["raw"]
-        copy_resume_to_clipboard(out_raw)
+        copy_resume_to_clipboard(out_raw, page=page)
         return {"parsed": found["parsed"], "raw": out_raw}
     parsed, raw = _unwrap_resume_parse(found)
     if not parsed or not _resume_ready(parsed):
@@ -841,7 +890,7 @@ def run_deepseek_chat(
             "(must contain 'name', 'experience', and 'summary')"
         )
     out_raw = raw or json.dumps(parsed, indent=2, ensure_ascii=False)
-    copy_resume_to_clipboard(out_raw)
+    copy_resume_to_clipboard(out_raw, page=page)
     return {
         "parsed": parsed,
         "raw": out_raw,
