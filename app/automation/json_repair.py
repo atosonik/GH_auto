@@ -90,7 +90,28 @@ def looks_like_resume(text: str) -> bool:
     return bool(
         re.search(r'"name"\s*:', text or "", re.I)
         and re.search(r'"experience"\s*:', text or "", re.I)
+        and re.search(r'"summary"\s*:', text or "", re.I)
     )
+
+
+def has_resume_required_fields(payload: dict[str, Any] | None) -> bool:
+    """Check if the JSON contains non-empty 'name', 'experience', and 'summary' fields."""
+    if not isinstance(payload, dict):
+        return False
+
+    keys = {str(k).strip().lower(): k for k in payload.keys()}
+    for field in ("name", "experience", "summary"):
+        if field not in keys:
+            return False
+        val = payload[keys[field]]
+        if val is None:
+            return False
+        if isinstance(val, str) and not val.strip():
+            return False
+        if isinstance(val, (dict, list)) and len(val) == 0:
+            return False
+
+    return True
 
 
 def parse_resume_json(text: str) -> dict[str, Any] | None:
@@ -142,6 +163,17 @@ def parse_resume_json(text: str) -> dict[str, Any] | None:
     shaped = [c for c in candidates if looks_like_resume(c)]
     ordered = sorted(shaped or candidates, key=len, reverse=True)
 
+    # 1. Best match: contains all required fields (name, experience, summary)
+    for candidate in ordered:
+        for attempt in (candidate, repair_json(candidate)[0]):
+            try:
+                parsed = json.loads(attempt)
+            except Exception:
+                continue
+            if isinstance(parsed, dict) and has_resume_required_fields(parsed):
+                return {"raw": attempt, "parsed": parsed, "source": candidate}
+
+    # 2. Candidate with name and at least experience or summary
     for candidate in ordered:
         for attempt in (candidate, repair_json(candidate)[0]):
             try:

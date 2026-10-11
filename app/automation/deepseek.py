@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from app.automation.json_repair import looks_like_resume, parse_resume_json
+from app.automation.json_repair import has_resume_required_fields, parse_resume_json
 
 COMPOSER_SELECTORS = [
     "#prompt-textarea",
@@ -617,29 +617,49 @@ def _looks_like_placeholder_resume(payload: dict[str, Any]) -> bool:
     return False
 
 
-def _resume_ready(payload: dict[str, Any] | None) -> bool:
-    """Require a complete-enough resume before leaving DeepSeek / calling Word."""
-    if not isinstance(payload, dict):
+def copy_resume_to_clipboard(payload_or_text: dict[str, Any] | str) -> bool:
+    """Save the finished resume JSON to system clipboard."""
+    if isinstance(payload_or_text, dict):
+        text = json.dumps(payload_or_text, indent=2, ensure_ascii=False)
+    else:
+        text = str(payload_or_text or "").strip()
+    if not text:
         return False
-    if not str(payload.get("name") or "").strip():
+
+    try:
+        import pyperclip
+        pyperclip.copy(text)
+        return True
+    except Exception:
+        pass
+
+    try:
+        import subprocess
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", "Set-Clipboard -Value $input"],
+            input=text,
+            text=True,
+            timeout=5,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _resume_ready(payload: dict[str, Any] | None) -> bool:
+    """
+    Check if generation is finished:
+    Must contain 'name', 'experience', and 'summary' fields, and not be placeholder.
+    """
+    if not has_resume_required_fields(payload):
         return False
     if _looks_like_placeholder_resume(payload):
         return False
-    experience = payload.get("experience")
-    if isinstance(experience, dict) and len(experience) > 0:
-        return True
-    if isinstance(experience, list) and len(experience) > 0:
-        return True
-    summary = str(payload.get("summary") or "").strip()
-    skills = payload.get("skills")
-    if summary and isinstance(skills, (dict, list)) and len(skills) > 0:
-        return True
-    # Skills-heavy replies still count if name + skills + some experience/summary signal.
-    if isinstance(skills, dict) and len(skills) >= 2 and (
-        summary or (isinstance(experience, dict) and experience)
-    ):
-        return True
-    return False
+    return True
 
 
 def _extract_from_page(page) -> dict[str, Any] | None:
@@ -811,13 +831,20 @@ def run_deepseek_chat(
     if not found:
         raise TimeoutError("Timed out waiting for DeepSeek resume JSON")
     if found.get("parsed") and found.get("raw"):
-        return {"parsed": found["parsed"], "raw": found["raw"]}
+        out_raw = found["raw"]
+        copy_resume_to_clipboard(out_raw)
+        return {"parsed": found["parsed"], "raw": out_raw}
     parsed, raw = _unwrap_resume_parse(found)
     if not parsed or not _resume_ready(parsed):
-        raise TimeoutError("DeepSeek reply was not a complete resume JSON yet")
+        raise TimeoutError(
+            "DeepSeek reply was not a complete resume JSON yet "
+            "(must contain 'name', 'experience', and 'summary')"
+        )
+    out_raw = raw or json.dumps(parsed, indent=2, ensure_ascii=False)
+    copy_resume_to_clipboard(out_raw)
     return {
         "parsed": parsed,
-        "raw": raw or json.dumps(parsed, indent=2, ensure_ascii=False),
+        "raw": out_raw,
     }
 
 

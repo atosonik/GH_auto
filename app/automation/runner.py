@@ -30,6 +30,7 @@ from app.automation.deepseek import (
     ask_deepseek_gaps,
     ask_deepseek_pick_option,
     assemble_prompt,
+    copy_resume_to_clipboard,
     load_profile_context,
     load_profiles_json,
     load_prompt,
@@ -726,7 +727,7 @@ class Runner:
                         if not _resume_ready(payload):
                             raise RuntimeError(
                                 "DeepSeek returned incomplete resume JSON "
-                                "(need name + experience, or summary + skills). "
+                                "(must contain 'name', 'experience', and 'summary'). "
                                 "Stay on the DeepSeek tab until the full object finishes."
                             )
 
@@ -779,6 +780,8 @@ class Runner:
                                 raw,
                                 count=1,
                             )
+                        if raw:
+                            copy_resume_to_clipboard(raw)
 
                         company = (
                             job.get("company")
