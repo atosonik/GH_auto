@@ -7,7 +7,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from app.automation.json_repair import has_resume_required_fields, parse_resume_json
+from app.automation.json_repair import (
+    has_resume_required_fields,
+    looks_like_resume,
+    parse_resume_json,
+)
 
 COMPOSER_SELECTORS = [
     "#prompt-textarea",
@@ -358,22 +362,40 @@ CLICK_BOTTOM_COPY_JS = """() => {
 
 def click_bottom_copy_if_shown(page) -> bool:
     """
-    Check if the bottom copy and retry buttons are shown for the assistant message.
-    If shown, clicks the copy button and returns True.
+    Click DeepSeek's bottom Copy control once Copy and Retry are both visible.
+
+    The toolbar is a sibling of `.ds-message`, inside the virtual-list row.
+    A locator on `.ds-message` never contains those buttons, and a DOM
+    `element.click()` is not a trusted click, so DeepSeek ignores it.
     """
     try:
-        # 1. Direct Playwright locator click on the copy button of the last message
-        last_row = page.locator("._4f9bf79, [data-virtual-list-item-key], .ds-message").last
-        if last_row.count() > 0:
-            copy_loc = last_row.locator("[role='button'].ds-button, button.ds-button, .ds-button--capsule").first
-            if copy_loc.count() > 0 and copy_loc.is_visible():
-                copy_loc.click(timeout=1000)
+        row = page.locator("[data-virtual-list-item-key], ._4f9bf79").filter(
+            has=page.locator(".ds-assistant-message-main-content")
+        ).last
+        if row.count() == 0:
+            return False
+        copy_btn = row.locator("[role='button'], button").filter(
+            has=page.locator("svg path[d^='M6.14929']")
+        ).first
+        retry_btn = row.locator("[role='button'], button").filter(
+            has=page.locator("svg path[d^='M7.92136']")
+        ).first
+        if copy_btn.count() == 0 or retry_btn.count() == 0:
+            return False
+        if not copy_btn.is_visible() or not retry_btn.is_visible():
+            return False
+        try:
+            copy_btn.scroll_into_view_if_needed(timeout=1500)
+        except Exception:
+            pass
+        copy_btn.click(timeout=2000)
+        return True
     except Exception:
         pass
 
     try:
         res = page.evaluate(CLICK_BOTTOM_COPY_JS)
-        return bool(res and (res.get("clicked") or res.get("shown")))
+        return bool(res and res.get("clicked"))
     except Exception:
         return False
 
@@ -725,18 +747,16 @@ def copy_resume_to_clipboard(payload_or_text: dict[str, Any] | str, page=None) -
     if not text:
         return False
 
-    # 1. In browser tab: click DeepSeek's bottom copy button and write to navigator.clipboard
-    if page:
-        click_bottom_copy_if_shown(page)
+    # 1. Click DeepSeek's own Copy button. That writes the message JSON.
+    # Leave that clipboard text alone when it is already a resume.
+    if page and click_bottom_copy_if_shown(page):
+        _sleep(450)
         try:
-            page.evaluate(
-                """(txt) => {
-                    if (navigator.clipboard && navigator.clipboard.writeText) {
-                        navigator.clipboard.writeText(txt).catch(() => {});
-                    }
-                }""",
-                text,
-            )
+            import pyperclip
+
+            current = pyperclip.paste() or ""
+            if looks_like_resume(current):
+                return True
         except Exception:
             pass
 
@@ -875,7 +895,6 @@ def run_deepseek_chat(
         reply_size = int(state.get("replySize") or 0)
         stopping = bool(state.get("stopping"))
         answers = int(state.get("answerCount") or 0)
-        composer_len = int(state.get("composerLen") or 0)
 
         # Only poke Continue while DeepSeek is still generating / truncated.
         if stopping:
@@ -911,20 +930,11 @@ def run_deepseek_chat(
         else:
             last_reply = reply_size
 
-        # Check if bottom copy and retry buttons are shown, and click the copy button!
-        bottom_clicked = click_bottom_copy_if_shown(page)
-        bottom_shown = (
-            bool(state.get("bottomButtonsShown"))
-            or bool(state.get("actionToolbar"))
-            or bottom_clicked
-        )
+        # Copy and Retry sit in the toolbar under the finished message.
+        # That toolbar is the signal that generation is done.
+        bottom_shown = bool(state.get("bottomButtonsShown"))
 
         if candidate:
-            # Immediately copy to clipboard as soon as all required fields are present
-            raw_cand = candidate.get("raw") or ""
-            if raw_cand:
-                copy_resume_to_clipboard(raw_cand, page=page)
-
             fingerprint = str(len(candidate.get("raw") or "")) + ":" + str(
                 (candidate.get("parsed") or {}).get("name") or ""
             )
@@ -937,24 +947,11 @@ def run_deepseek_chat(
             ready_for = time.time() - (ready_since or time.time())
             quiet_for = time.time() - quiet_since
 
-            # 1. Action toolbar (Copy / Retry buttons) rendered -> click copy and finish!
             if bottom_shown:
                 found = candidate
                 break
-            # 2. Generation finished: no Stop button, composer idle, JSON ready.
-            # Keep this snappy — users were waiting 10s+ after JSON appeared.
-            if not stopping and ready_for >= 0.25 and quiet_for >= 0.25:
-                found = candidate
-                break
-            if not stopping and composer_len == 0 and ready_for >= 0.2:
-                found = candidate
-                break
-            # 3. Some DeepSeek builds leave a Stop-like control stuck visible.
-            if ready_for >= 1.2 and quiet_for >= 0.6:
-                found = candidate
-                break
-            # 4. Valid complete JSON + not growing: take it even if Stop flickers.
-            if ready_for >= 0.8 and not grew:
+            # Toolbar never appeared. Still finish once the JSON has stayed still.
+            if not stopping and ready_for >= 20 and quiet_for >= 2:
                 found = candidate
                 break
         elif bottom_shown:

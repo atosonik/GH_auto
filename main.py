@@ -14,8 +14,10 @@ def main() -> int:
         sys.path.insert(0, str(root))
 
     from app.automation.resume_server import start_resume_server, stop_resume_server
+    from app.store import load_state
 
-    start_resume_server(615)
+    settings = load_state(root / ".app-data")["settings"]
+    start_resume_server(int(settings.get("resumeServerPort") or 615))
 
     app = QApplication(sys.argv)
     app.setApplicationName("Greenhouse Auto Apply")

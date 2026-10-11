@@ -16,19 +16,15 @@ Python desktop app that applies to Greenhouse jobs **per Chrome profile**.
 ## Setup
 
 ```powershell
-cd C:\greenhouse
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 playwright install chromium
 ```
 
-Point **Settings** at your bid Chrome extension folder:
+In **Settings**, choose the extension folder that contains `prompts/`, `profile-context/`, and `profiles.json`. Those paths are not set until you pick a folder.
 
-- extension folder → `D:\3.Work\Develop\bid\extension-deepseek`
-  (automatically resolves `prompts/`, `profile-context/`, and `profiles.json`)
-
-Profile **names must match** `profiles.json` / prompt filenames exactly (e.g. `Peter Chu`).
+Profile **names must match** `profiles.json` and the prompt filenames exactly.
 
 ## Run
 
@@ -45,7 +41,7 @@ Used only when Greenhouse asks for a verification code.
 **Outlook** (Thunderbird method — IMAP + OAuth2, not Graph):
 1. Set the profile mailbox email (Outlook preset)
 2. One-time browser login:
-   `python scripts/outlook_login.py --profile "Robert Yuan"`
+   `python scripts/outlook_login.py --profile "Your Name"`
 3. Tokens are cached under `.app-data/imap-tokens/`
 
 **Gmail**: set preset Gmail + app password in the profile row.

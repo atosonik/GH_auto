@@ -3,8 +3,8 @@ One-time Outlook IMAP OAuth login (Thunderbird-style).
 
 Opens a Microsoft browser window, caches a refresh token, then lists recent mail.
 
-  python scripts/outlook_login.py --user robertyuan81@outlook.com
-  python scripts/outlook_login.py --profile "Robert Yuan"
+  python scripts/outlook_login.py --user you@outlook.com
+  python scripts/outlook_login.py --profile "Your Name"
 """
 
 from __future__ import annotations

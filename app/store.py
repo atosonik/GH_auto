@@ -5,26 +5,40 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-BID_ROOT = Path(r"D:\3.Work\Develop\bid")
+
+def _extension_paths(extension_dir: str) -> dict[str, str]:
+    folder = str(extension_dir or "").strip()
+    if not folder:
+        return {
+            "extensionDir": "",
+            "promptsDir": "",
+            "profileContextDir": "",
+            "profilesJsonPath": "",
+        }
+    root = Path(folder)
+    return {
+        "extensionDir": str(root),
+        "promptsDir": str(root / "prompts"),
+        "profileContextDir": str(root / "profile-context"),
+        "profilesJsonPath": str(root / "profiles.json"),
+    }
 
 
 def default_settings() -> dict[str, Any]:
-    home = Path.home()
-    chrome_user_data = home / "AppData" / "Local" / "Google" / "Chrome" / "User Data"
-    ext_dir = BID_ROOT / "extension-deepseek"
-    return {
-        "extensionDir": str(ext_dir),
-        "promptsDir": str(ext_dir / "prompts"),
-        "profileContextDir": str(ext_dir / "profile-context"),
-        "profilesJsonPath": str(ext_dir / "profiles.json"),
-        "chromeUserDataDir": str(chrome_user_data),
-        "theme": "system",
-        # isolated = private profile copies (normal Chrome can stay open after first sync)
-        # live = drive real Chrome profiles via CDP (other profile windows stay open)
-        "browserMode": "isolated",
-        "chromeDebugPort": 9222,
-        "resumeServerPort": 615,
-    }
+    chrome_user_data = Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "User Data"
+    settings = _extension_paths("")
+    settings.update(
+        {
+            "chromeUserDataDir": str(chrome_user_data),
+            "theme": "system",
+            # isolated = private profile copies (normal Chrome can stay open after first sync)
+            # live = drive real Chrome profiles via CDP (other profile windows stay open)
+            "browserMode": "isolated",
+            "chromeDebugPort": 9222,
+            "resumeServerPort": 615,
+        }
+    )
+    return settings
 
 
 def _state_path(user_data: Path) -> Path:
@@ -58,20 +72,15 @@ def load_state(user_data: Path) -> dict[str, Any]:
     merged = default_settings()
     merged.update({k: v for k, v in settings.items() if isinstance(v, (str, int, float, bool))})
 
-    ext_val = settings.get("extensionDir") or merged.get("extensionDir")
-    if not ext_val or ext_val == str(BID_ROOT / "extension-deepseek"):
-        if settings.get("profilesJsonPath"):
-            ext_val = str(Path(settings["profilesJsonPath"]).parent)
-        elif settings.get("promptsDir"):
-            ext_val = str(Path(settings["promptsDir"]).parent)
-        elif not ext_val:
-            ext_val = str(BID_ROOT / "extension-deepseek")
-    merged["extensionDir"] = ext_val
-
-    ext_p = Path(merged["extensionDir"])
-    merged["promptsDir"] = str(ext_p / "prompts")
-    merged["profileContextDir"] = str(ext_p / "profile-context")
-    merged["profilesJsonPath"] = str(ext_p / "profiles.json")
+    ext_val = str(settings.get("extensionDir") or "").strip()
+    if not ext_val:
+        profiles_json = str(settings.get("profilesJsonPath") or "").strip()
+        prompts_dir = str(settings.get("promptsDir") or "").strip()
+        if profiles_json:
+            ext_val = str(Path(profiles_json).parent)
+        elif prompts_dir:
+            ext_val = str(Path(prompts_dir).parent)
+    merged.update(_extension_paths(ext_val))
 
     for obs in ("mainPyPath", "resumeOutputDir", "pythonPath"):
         merged.pop(obs, None)
@@ -89,12 +98,9 @@ def save_state(user_data: Path, partial: dict[str, Any]) -> dict[str, Any]:
         next_state["profiles"] = partial["profiles"]
     if "settings" in partial and isinstance(partial["settings"], dict):
         next_state["settings"].update(partial["settings"])
-        ext_val = next_state["settings"].get("extensionDir")
-        if ext_val:
-            ext_p = Path(ext_val)
-            next_state["settings"]["promptsDir"] = str(ext_p / "prompts")
-            next_state["settings"]["profileContextDir"] = str(ext_p / "profile-context")
-            next_state["settings"]["profilesJsonPath"] = str(ext_p / "profiles.json")
+        next_state["settings"].update(
+            _extension_paths(str(next_state["settings"].get("extensionDir") or ""))
+        )
         for obs in ("mainPyPath", "resumeOutputDir", "pythonPath"):
             next_state["settings"].pop(obs, None)
 

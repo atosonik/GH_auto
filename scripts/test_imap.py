@@ -5,8 +5,8 @@ Outlook (default): Thunderbird-style IMAP + OAuth2
 Gmail: app password
 
 Usage:
-  python scripts/test_imap.py --profile "Robert Yuan"
-  python scripts/outlook_login.py --profile "Robert Yuan"   # first-time Outlook login
+  python scripts/test_imap.py --profile "Your Name"
+  python scripts/outlook_login.py --profile "Your Name"   # first-time Outlook login
   python scripts/test_imap.py --user you@gmail.com --password "xxxx" --preset gmail
 """
 

@@ -217,7 +217,9 @@ class SettingsDialog(QDialog):
         if not cur_ext and settings.get("promptsDir"):
             cur_ext = str(Path(settings["promptsDir"]).parent)
         self.extension_dir_edit = QLineEdit(cur_ext)
-        self.extension_dir_edit.setPlaceholderText(r"D:\3.Work\Develop\bid\extension-deepseek")
+        self.extension_dir_edit.setPlaceholderText(
+            "Folder with prompts/, profile-context/, and profiles.json"
+        )
         browse_btn = QPushButton("Browse...")
         browse_btn.setObjectName("ghost")
         browse_btn.clicked.connect(self._browse_extension_dir)
@@ -515,7 +517,7 @@ class MainWindow(QMainWindow):
             self.profile_list.addWidget(
                 self._empty_state(
                     "No people yet",
-                    "Add someone like “Robert Yuan”, set their Chrome profile number, and optional IMAP for security codes.",
+                    "Add a person, set their Chrome profile number, and optional IMAP for security codes.",
                 )
             )
         else:

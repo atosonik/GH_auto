@@ -249,7 +249,12 @@ class Runner:
         self._contexts_lock = threading.Lock()
         start_resume_server(int(settings.get("resumeServerPort") or 615))
         self.resume_bridge = ResumeBridge(settings)
-        self.profiles_json = load_profiles_json(settings["profilesJsonPath"])
+        profiles_path = str(settings.get("profilesJsonPath") or "").strip()
+        if not profiles_path:
+            raise RuntimeError(
+                "Set the extension folder in Settings. It must contain profiles.json, prompts/, and profile-context/."
+            )
+        self.profiles_json = load_profiles_json(profiles_path)
 
     def is_running(self) -> bool:
         return self.running
