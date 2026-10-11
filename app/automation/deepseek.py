@@ -237,9 +237,31 @@ PAGE_STATE_JS = """() => {
               const reply = last ? (last.innerText || last.textContent || '') : '';
               const text = document.body?.innerText || '';
 
-              // DeepSeek mounts an action toolbar with Copy/Retry/Like buttons ONLY when generation finishes.
-              const row = last ? (last.closest('[data-virtual-list-item-key], ._4f9bf79, .ds-message') || last.parentElement) : null;
-              const actionToolbar = Boolean(
+              // Check if the bottom action toolbar containing Copy & Retry buttons is shown
+              const row = last
+                ? (last.closest('[data-virtual-list-item-key], ._4f9bf79') || last.parentElement?.parentElement || last.parentElement)
+                : null;
+              const actionButtons = row ? Array.from(row.querySelectorAll('.ds-button, [role="button"]')) : [];
+
+              let copyBtn = null;
+              let retryBtn = null;
+              for (const btn of actionButtons) {
+                const svgPath = btn.querySelector('svg path')?.getAttribute('d') || '';
+                const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+                const t = (btn.innerText || '').toLowerCase();
+                if (svgPath.includes('M6.14929') || aria.includes('copy') || t.includes('copy')) {
+                  copyBtn = btn;
+                } else if (svgPath.includes('M7.92136') || aria.includes('retry') || aria.includes('regenerate') || t.includes('retry')) {
+                  retryBtn = btn;
+                }
+              }
+              if (!copyBtn && actionButtons.length >= 2) {
+                copyBtn = actionButtons[0];
+                retryBtn = actionButtons[1];
+              }
+
+              const bottomButtonsShown = Boolean(copyBtn && retryBtn);
+              const actionToolbar = bottomButtonsShown || Boolean(
                 row && (
                   row.querySelector('._0a3d93b, ._965abe9, .ds-button--capsule, [class*="action"], [class*="footer"]') ||
                   row.parentElement?.querySelector('._0a3d93b, ._965abe9, .ds-button--capsule')
@@ -254,6 +276,7 @@ PAGE_STATE_JS = """() => {
                 answerCount: nodes.length,
                 stopping,
                 actionToolbar,
+                bottomButtonsShown,
                 composerLen: (function () {
                   const el =
                     document.querySelector('#prompt-textarea') ||
@@ -288,6 +311,61 @@ REPLY_PAYLOAD_JS = """() => {
           texts.push((document.body?.innerText || '').trim());
           return texts;
         }"""
+
+CLICK_BOTTOM_COPY_JS = """() => {
+          const assistantNodes = Array.from(document.querySelectorAll(
+            '.ds-assistant-message-main-content, [data-message-author-role="assistant"]'
+          ));
+          const lastNode = assistantNodes.length ? assistantNodes[assistantNodes.length - 1] : document.querySelector('.ds-markdown');
+          if (!lastNode) return { shown: false, clicked: false };
+
+          const row = lastNode.closest('[data-virtual-list-item-key], ._4f9bf79') || lastNode.parentElement?.parentElement || lastNode.parentElement;
+          if (!row) return { shown: false, clicked: false };
+
+          const buttons = Array.from(row.querySelectorAll('.ds-button, [role="button"]'));
+          let copyBtn = null;
+          let retryBtn = null;
+
+          for (const btn of buttons) {
+            const svgPath = btn.querySelector('svg path')?.getAttribute('d') || '';
+            const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+            const text = (btn.innerText || '').toLowerCase();
+
+            if (svgPath.includes('M6.14929') || aria.includes('copy') || text.includes('copy')) {
+              copyBtn = btn;
+            } else if (svgPath.includes('M7.92136') || aria.includes('retry') || aria.includes('regenerate') || text.includes('retry')) {
+              retryBtn = btn;
+            }
+          }
+
+          if (!copyBtn && buttons.length >= 2) {
+            copyBtn = buttons[0];
+            retryBtn = buttons[1];
+          }
+
+          const shown = Boolean(copyBtn && retryBtn);
+          let clicked = false;
+          if (shown && copyBtn) {
+            copyBtn.click();
+            try {
+              copyBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+            } catch (_) {}
+            clicked = true;
+          }
+          return { shown, clicked };
+        }"""
+
+
+def click_bottom_copy_if_shown(page) -> bool:
+    """
+    Check if the bottom copy and retry buttons are shown for the assistant message.
+    If shown, clicks the copy button and returns True.
+    """
+    try:
+        res = page.evaluate(CLICK_BOTTOM_COPY_JS)
+        return bool(res and (res.get("clicked") or res.get("shown")))
+    except Exception:
+        return False
 
 
 def _sleep(ms: float) -> None:
@@ -637,22 +715,12 @@ def copy_resume_to_clipboard(payload_or_text: dict[str, Any] | str, page=None) -
     if not text:
         return False
 
-    # 1. In browser tab: click DeepSeek's native copy button or use navigator.clipboard
+    # 1. In browser tab: click DeepSeek's bottom copy button and write to navigator.clipboard
     if page:
+        click_bottom_copy_if_shown(page)
         try:
             page.evaluate(
                 """(txt) => {
-                    // Try clicking DeepSeek native copy button first
-                    const roots = Array.from(document.querySelectorAll('.ds-assistant-message-main-content, .ds-message'));
-                    const last = roots.length ? roots[roots.length - 1] : null;
-                    const row = last ? (last.closest('[data-virtual-list-item-key], ._4f9bf79, .ds-message') || last.parentElement) : null;
-                    if (row) {
-                        const copyBtn = row.querySelector('.ds-button, [role="button"]');
-                        if (copyBtn) {
-                            copyBtn.click();
-                            return;
-                        }
-                    }
                     if (navigator.clipboard && navigator.clipboard.writeText) {
                         navigator.clipboard.writeText(txt).catch(() => {});
                     }
@@ -796,7 +864,6 @@ def run_deepseek_chat(
         reply = state.get("reply") or ""
         reply_size = int(state.get("replySize") or 0)
         stopping = bool(state.get("stopping"))
-        action_toolbar = bool(state.get("actionToolbar"))
         answers = int(state.get("answerCount") or 0)
         composer_len = int(state.get("composerLen") or 0)
 
@@ -834,6 +901,14 @@ def run_deepseek_chat(
         else:
             last_reply = reply_size
 
+        # Check if bottom copy and retry buttons are shown, and click the copy button!
+        bottom_clicked = click_bottom_copy_if_shown(page)
+        bottom_shown = (
+            bool(state.get("bottomButtonsShown"))
+            or bool(state.get("actionToolbar"))
+            or bottom_clicked
+        )
+
         if candidate:
             # Immediately copy to clipboard as soon as all required fields are present
             raw_cand = candidate.get("raw") or ""
@@ -852,8 +927,8 @@ def run_deepseek_chat(
             ready_for = time.time() - (ready_since or time.time())
             quiet_for = time.time() - quiet_since
 
-            # 1. Action toolbar (Copy / Retry buttons) rendered -> generation finished!
-            if action_toolbar:
+            # 1. Action toolbar (Copy / Retry buttons) rendered -> click copy and finish!
+            if bottom_shown:
                 found = candidate
                 break
             # 2. Generation finished: no Stop button, composer idle, JSON ready.
@@ -870,6 +945,11 @@ def run_deepseek_chat(
                 break
             # 4. Valid complete JSON + not growing: take it even if Stop flickers.
             if ready_for >= 0.8 and not grew:
+                found = candidate
+                break
+        elif bottom_shown:
+            candidate = _extract_from_page(page)
+            if candidate:
                 found = candidate
                 break
 
