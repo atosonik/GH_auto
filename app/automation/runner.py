@@ -806,21 +806,15 @@ class Runner:
                             stop_requested=lambda: self.stop_requested,
                         )
                         if not pdf_path or not Path(pdf_path).exists():
-                            # If path came from localhost:615 but has not settled on disk yet
+                            # If path came from exporter notification but has not settled on disk yet
                             if pdf_path:
                                 wait_file = time.time()
                                 while not Path(pdf_path).exists() and time.time() - wait_file < 6.0:
                                     time.sleep(0.3)
                         if not pdf_path or not Path(pdf_path).exists():
-                            matched = self.resume_bridge.find_resume_pdf(
-                                name, company=company, after_ts=resume_started
-                            )
-                            if matched:
-                                pdf_path = matched
-                        if not pdf_path or not Path(pdf_path).exists():
                             raise RuntimeError(
                                 f'Resume PDF was not found at "{pdf_path}". '
-                                "Expected notification on localhost:615 with resume location."
+                                "Check that your exporter tool generated the file and notified localhost:615."
                             )
 
                         resume_folder = str(Path(pdf_path).resolve().parent)

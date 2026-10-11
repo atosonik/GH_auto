@@ -362,6 +362,16 @@ def click_bottom_copy_if_shown(page) -> bool:
     If shown, clicks the copy button and returns True.
     """
     try:
+        # 1. Direct Playwright locator click on the copy button of the last message
+        last_row = page.locator("._4f9bf79, [data-virtual-list-item-key], .ds-message").last
+        if last_row.count() > 0:
+            copy_loc = last_row.locator("[role='button'].ds-button, button.ds-button, .ds-button--capsule").first
+            if copy_loc.count() > 0 and copy_loc.is_visible():
+                copy_loc.click(timeout=1000)
+    except Exception:
+        pass
+
+    try:
         res = page.evaluate(CLICK_BOTTOM_COPY_JS)
         return bool(res and (res.get("clicked") or res.get("shown")))
     except Exception:
