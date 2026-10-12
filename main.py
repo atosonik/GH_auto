@@ -20,7 +20,7 @@ def main() -> int:
     start_resume_server(int(settings.get("resumeServerPort") or 615))
 
     app = QApplication(sys.argv)
-    app.setApplicationName("Greenhouse Auto Apply")
+    app.setApplicationName("Bidding")
     window = MainWindow(root / ".app-data")
     window.show()
     code = app.exec_()

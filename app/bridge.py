@@ -129,9 +129,6 @@ class Bridge(QObject):
         self.worker.failed.connect(lambda err: self.runStateChanged.emit(
             json.dumps({"running": False, "message": "Start failed", "error": err})
         ))
-        self.worker.finished_ok.connect(lambda: self.runStateChanged.emit(
-            json.dumps({"running": False, "message": "Finished"})
-        ))
         self.worker.start()
 
     def stop(self) -> None:

@@ -608,6 +608,9 @@ class Runner:
                     error = future.exception()
                     if error and not self.stop_requested:
                         failures += 1
+                        continue
+                    if future.result() and not self.stop_requested:
+                        failures += 1
 
             if self.on_run_state:
                 if self.stop_requested:
@@ -630,26 +633,65 @@ class Runner:
                 self._contexts.clear()
                 self._browsers.clear()
 
-    def run_profile(self, prepared: dict[str, Any], urls: list[dict[str, Any]]) -> None:
+    def _fail_profile_jobs(
+        self,
+        profile_id: str,
+        jobs: list[dict[str, Any]],
+        error: BaseException,
+    ) -> None:
+        detail = str(error).splitlines()[0][:180] if str(error).strip() else error.__class__.__name__
+        for job in jobs:
+            if job.get("state") not in {"submitted", "skipped"}:
+                job["state"] = "failed"
+                job["error"] = detail
+        self.set_job_state(profile_id, jobs, f"failed: {detail}")
+
+    def run_profile(self, prepared: dict[str, Any], urls: list[dict[str, Any]]) -> bool:
+        """Run one profile. Returns True when any job failed."""
         profile = prepared["profile"]
         profile_id = profile.get("id") or profile.get("name")
         name = (profile.get("name") or "").strip()
-        personal = self.profiles_json.get(name)
-        if not personal:
-            raise RuntimeError(
-                f'No profiles.json entry for "{name}". Name must match exactly.'
-            )
-
-        prompt_text = load_prompt(self.settings["promptsDir"], name)
-        profile_context = load_profile_context(self.settings["profileContextDir"], name)
-
         jobs = [
             {"urlId": u.get("id"), "url": u.get("url"), "state": "queued"}
             for u in urls
         ]
         self.set_job_state(profile_id, jobs, "queued")
 
+        personal = self.profiles_json.get(name)
+        if not personal:
+            error = RuntimeError(
+                f'No profiles.json entry for "{name}". Name must match exactly.'
+            )
+            self._fail_profile_jobs(profile_id, jobs, error)
+            return True
+
+        try:
+            prompt_text = load_prompt(self.settings["promptsDir"], name)
+        except OSError as error:
+            self._fail_profile_jobs(profile_id, jobs, error)
+            return True
+        profile_context = load_profile_context(self.settings["profileContextDir"], name)
+
         # Each profile thread owns its Playwright instance (required for Sync API).
+        try:
+            return self._run_profile_browser(
+                prepared, profile_id, name, personal, prompt_text, profile_context, jobs
+            )
+        except Exception as error:
+            self._fail_profile_jobs(profile_id, jobs, error)
+            return True
+
+    def _run_profile_browser(
+        self,
+        prepared: dict[str, Any],
+        profile_id: str,
+        name: str,
+        personal: dict[str, Any],
+        prompt_text: str,
+        profile_context: str,
+        jobs: list[dict[str, Any]],
+    ) -> bool:
+        had_failure = False
         with sync_playwright() as playwright:
             browser = None
             if prepared.get("browser_mode") == "live":
@@ -846,7 +888,7 @@ class Runner:
                             },
                         )
                         context_text = _with_candidate_facts(profile_context, gh_profile)
-                        imap_cfg = resolve_imap_config(profile, personal)
+                        imap_cfg = resolve_imap_config(prepared["profile"], personal)
                         answer_cache: dict[str, Any] = {}
                         cover_text = ""
                         confirmed = False
@@ -917,9 +959,10 @@ class Runner:
                         self.set_job_state(profile_id, jobs, "submitted")
                     except Exception as error:
                         # Fail this job only; keep Chrome open and continue the queue.
+                        had_failure = True
                         if url_item.get("state") not in {"submitted", "skipped"}:
                             url_item["state"] = "failed"
-                            url_item["error"] = str(error)
+                            url_item["error"] = str(error).splitlines()[0][:180]
                         self.set_job_state(profile_id, jobs, f"failed: {error}")
                         continue
             finally:
@@ -931,3 +974,4 @@ class Runner:
                         context.close()
                     except Exception:
                         pass
+        return had_failure
